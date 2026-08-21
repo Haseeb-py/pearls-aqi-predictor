@@ -1,0 +1,26 @@
+# Local secrets and environments
+.env
+.venv/
+venv/
+
+# Python/tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated local data, models, plots, and browser profiles
+artifacts/data/
+artifacts/models/
+artifacts/eda/
+artifacts/experiments/
+artifacts/chrome-headless-profile*/
+artifacts/copilot-shot-profile/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.log
+Thumbs.db

@@ -1,0 +1,21 @@
+model_name: pearls_aqi_predictor
+target_col: aqi
+horizons: [24, 48, 72]
+
+ridge:
+  alpha_grid: [0.1, 1.0, 10.0, 30.0]
+  solver: auto
+
+random_forest:
+  n_estimators: [150, 250]
+  max_depth: [6, 10, 14]
+  min_samples_leaf: [2, 5, 10]
+  random_state: 42
+
+tuning:
+  cv_splits: 3
+  rf_candidates: 6
+
+evaluation:
+  primary_metric: mae
+  metrics: [mae, rmse, r2]

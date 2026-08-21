@@ -1,0 +1,30 @@
+name: Daily model training
+
+on:
+  schedule:
+    - cron: "35 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-training-pipeline
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+      HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
+      HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: |
+          for city in karachi islamabad peshawar quetta sargodha; do
+            python pipelines/training_pipeline.py --city "$city" --feature-store --final-city-selection --upload-hopsworks
+          done
+          python pipelines/training_pipeline.py --city lahore --feature-store --per-horizon-champions --upload-hopsworks

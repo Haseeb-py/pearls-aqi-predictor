@@ -1,0 +1,50 @@
+required_features:
+  - hour
+  - day
+  - month
+  - day_of_week
+  - is_weekend
+  - hour_sin
+  - hour_cos
+  - month_sin
+  - month_cos
+  - temperature_2m_c
+  - relative_humidity_2m_pct
+  - surface_pressure_hpa
+  - wind_speed_10m_kph
+  - precipitation_mm
+  - pm2_5_ug_m3
+  - pm10_ug_m3
+  - carbon_monoxide_ug_m3
+  - nitrogen_dioxide_ug_m3
+  - sulphur_dioxide_ug_m3
+  - ozone_ug_m3
+  - aqi
+  - aqi_lag_1h
+  - aqi_lag_3h
+  - aqi_lag_6h
+  - aqi_lag_12h
+  - aqi_lag_24h
+  - aqi_lag_48h
+  - aqi_lag_72h
+  - aqi_change_rate_1h
+  - aqi_change_rate_3h
+  - aqi_change_rate_24h
+  - aqi_pct_change_1h
+  - aqi_pct_change_3h
+  - aqi_pct_change_24h
+  - aqi_rolling_mean_3h
+  - aqi_rolling_std_3h
+  - aqi_rolling_mean_6h
+  - aqi_rolling_std_6h
+  - aqi_rolling_mean_12h
+  - aqi_rolling_std_12h
+  - aqi_rolling_mean_24h
+  - aqi_rolling_std_24h
+
+targets:
+  - target_aqi_24h
+  - target_aqi_48h
+  - target_aqi_72h
+
+horizons_hours: [24, 48, 72]

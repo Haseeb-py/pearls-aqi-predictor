@@ -1,0 +1,43 @@
+cities:
+  - name: Karachi
+    slug: karachi
+    province: Sindh
+    latitude: 24.8607
+    longitude: 67.0011
+    timezone: Asia/Karachi
+    enabled: true
+  - name: Lahore
+    slug: lahore
+    province: Punjab
+    latitude: 31.5204
+    longitude: 74.3587
+    timezone: Asia/Karachi
+    enabled: true
+  - name: Islamabad
+    slug: islamabad
+    territory: Islamabad Capital Territory
+    latitude: 33.6844
+    longitude: 73.0479
+    timezone: Asia/Karachi
+    enabled: true
+  - name: Peshawar
+    slug: peshawar
+    province: Khyber Pakhtunkhwa
+    latitude: 34.0151
+    longitude: 71.5249
+    timezone: Asia/Karachi
+    enabled: true
+  - name: Quetta
+    slug: quetta
+    province: Balochistan
+    latitude: 30.1798
+    longitude: 66.9750
+    timezone: Asia/Karachi
+    enabled: true
+  - name: Sargodha
+    slug: sargodha
+    province: Punjab
+    latitude: 32.0836
+    longitude: 72.6711
+    timezone: Asia/Karachi
+    enabled: true
