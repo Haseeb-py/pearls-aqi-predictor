@@ -288,7 +288,8 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
     tools_used: list[str] = []
     if len(cities) > 1:
         result, event = _run_tool(correlation_id, "compare_cities", cities)
-        events.append(event); tools_used.append("compare_cities")
+        events.append(event)
+        tools_used.append("compare_cities")
         if result is not None:
             evidence["comparison"] = result
     elif cities:
@@ -316,7 +317,8 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
             plan = [("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))]
         for key, tool, args in plan:
             result, event = _run_tool(correlation_id, tool, *args)
-            events.append(event); tools_used.append(tool)
+            events.append(event)
+            tools_used.append(tool)
             if result is not None:
                 evidence[key] = result
     return {"answer": _answer(text, evidence, cities), "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}

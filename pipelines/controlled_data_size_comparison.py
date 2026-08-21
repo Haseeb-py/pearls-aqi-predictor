@@ -17,9 +17,12 @@ def fit_and_score(data, train, test):
     base = [column for column in FEATURE_COLUMNS if column in data.columns]
     pruned = [column for column in base if column not in PRUNED_COLUMNS]
     features = {target: pruned + [column for column in data.columns if column.startswith("forecast_") and column.endswith(target.split("_")[-1])] for target in TARGET_COLUMNS}
-    ridge = MultiHorizonRidgeModel(alpha=10.0, feature_cols=base); ridge.fit(train, ["target_aqi_24h"])
-    forest = MultiHorizonRandomForestModel(feature_cols=base, n_estimators=250, max_depth=6, min_samples_leaf=10); forest.fit(train, ["target_aqi_24h"])
-    neural = MultiHorizonTorchModel(features); neural.fit(train, TARGET_COLUMNS)
+    ridge = MultiHorizonRidgeModel(alpha=10.0, feature_cols=base)
+    ridge.fit(train, ["target_aqi_24h"])
+    forest = MultiHorizonRandomForestModel(feature_cols=base, n_estimators=250, max_depth=6, min_samples_leaf=10)
+    forest.fit(train, ["target_aqi_24h"])
+    neural = MultiHorizonTorchModel(features)
+    neural.fit(train, TARGET_COLUMNS)
     model = PerHorizonChampion({"ridge_24h": ridge, "forest_24h": forest, "pruned_neural": neural})
     predictions = model.predict(test)
     return {target: calculate_metrics(test[target].to_numpy(), predictions[target]) for target in TARGET_COLUMNS}

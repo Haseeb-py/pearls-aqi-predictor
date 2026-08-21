@@ -52,9 +52,12 @@ def run_per_horizon_training_pipeline(city_slug: str = "lahore", local_path: str
     pruned = [column for column in base if column not in PRUNED_COLUMNS]
     pruned_features = {target: pruned + [column for column in data.columns if column.startswith("forecast_") and column.endswith(target.split("_")[-1])] for target in TARGET_COLUMNS}
     # Validation-selected configurations from the recorded fixed ablations.
-    ridge = MultiHorizonRidgeModel(alpha=10.0, feature_cols=base); ridge.fit(train_df, ["target_aqi_24h"])
-    forest = MultiHorizonRandomForestModel(feature_cols=base, n_estimators=250, max_depth=6, min_samples_leaf=10); forest.fit(train_df, ["target_aqi_24h"])
-    neural = MultiHorizonTorchModel(pruned_features); neural.fit(train_df, TARGET_COLUMNS)
+    ridge = MultiHorizonRidgeModel(alpha=10.0, feature_cols=base)
+    ridge.fit(train_df, ["target_aqi_24h"])
+    forest = MultiHorizonRandomForestModel(feature_cols=base, n_estimators=250, max_depth=6, min_samples_leaf=10)
+    forest.fit(train_df, ["target_aqi_24h"])
+    neural = MultiHorizonTorchModel(pruned_features)
+    neural.fit(train_df, TARGET_COLUMNS)
     champion = PerHorizonChampion({"ridge_24h": ridge, "forest_24h": forest, "pruned_neural": neural})
     predictions = champion.predict(test_df)
     metrics = {target: calculate_metrics(test_df[target].to_numpy(), predictions[target]) for target in TARGET_COLUMNS}
@@ -93,7 +96,8 @@ def run_final_city_selection_pipeline(city_slug: str, local_path: str | None = N
         else:
             ridge = MultiHorizonRidgeModel(alpha=profile["ridge_alpha"], feature_cols=feature_cols)
             forest = MultiHorizonRandomForestModel(feature_cols=feature_cols, n_estimators=profile["n_estimators"], max_depth=profile["max_depth"], min_samples_leaf=profile["min_samples_leaf"])
-            ridge.fit(train_df, [target]); forest.fit(train_df, [target])
+            ridge.fit(train_df, [target])
+            forest.fit(train_df, [target])
             served[target] = {"kind": "blend", "ridge": ridge, "forest": forest, "ridge_weight": profile["ridge_weight"]}
             metadata[target] = {"model": "ridge_random_forest_blend", "ridge_weight": profile["ridge_weight"], "random_forest_weight": 1 - profile["ridge_weight"], "feature_set": profile["features"]}
     champion = SelectedPerHorizonChampion(served)

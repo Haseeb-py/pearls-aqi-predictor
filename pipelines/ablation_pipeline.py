@@ -14,7 +14,6 @@ from pearls_aqi.models.train import (
     FEATURE_COLUMNS,
     FORECAST_WEATHER_COLUMNS,
     TARGET_COLUMNS,
-    _tuned_models,
     train_and_evaluate,
 )
 

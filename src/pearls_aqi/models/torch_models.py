@@ -43,7 +43,9 @@ class MultiHorizonTorchModel:
             best_loss, best_state, patience = float("inf"), None, 0
             for _ in range(self.epochs):
                 model.train()
-                optimizer.zero_grad(); nn.MSELoss()(model(x_tensor), y_tensor).backward(); optimizer.step()
+                optimizer.zero_grad()
+                nn.MSELoss()(model(x_tensor), y_tensor).backward()
+                optimizer.step()
                 model.eval()
                 with torch.no_grad():
                     validation_loss = nn.MSELoss()(model(x_validation), y_validation).item()
@@ -52,7 +54,8 @@ class MultiHorizonTorchModel:
                     best_loss, best_state, patience = validation_loss, {k: v.clone() for k, v in model.state_dict().items()}, 0
                 else:
                     patience += 1
-                    if patience >= 30: break
+                    if patience >= 30:
+                        break
             model.load_state_dict(best_state)
             self.imputers[target], self.scalers[target], self.target_scalers[target], self.models[target] = imputer, scaler, y_scaler, model.eval()
 
