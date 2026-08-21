@@ -321,4 +321,8 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
             tools_used.append(tool)
             if result is not None:
                 evidence[key] = result
-    return {"answer": _answer(text, evidence, cities), "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+    if events and not evidence and all(event["outcome"] == "unavailable" for event in events):
+        answer = "The requested AQI data is unavailable, so I cannot provide a number."
+    else:
+        answer = _answer(text, evidence, cities)
+    return {"answer": answer, "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
