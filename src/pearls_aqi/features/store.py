@@ -144,6 +144,15 @@ def upsert_features_df(df: pd.DataFrame) -> Tuple[int, str]:
     df_upload = df.copy()
     if pd.api.types.is_datetime64_any_dtype(df_upload["event_time_utc"]):
         df_upload["event_time_utc"] = pd.to_datetime(df_upload["event_time_utc"], utc=True)
+    # Keep these types aligned with the already-registered Hopsworks schema.
+    # ``ingested_at_utc`` is metadata rather than the feature group's event time,
+    # so it is intentionally stored there as an ISO-8601 string.
+    if "ingested_at_utc" in df_upload:
+        df_upload["ingested_at_utc"] = pd.to_datetime(
+            df_upload["ingested_at_utc"], utc=True
+        ).astype(str)
+    if "is_weekend" in df_upload:
+        df_upload["is_weekend"] = df_upload["is_weekend"].astype("int32")
     for column in df_upload.select_dtypes(include=["number"]).columns:
         if column not in {"hour", "day", "month", "day_of_week", "is_weekend"}:
             df_upload[column] = df_upload[column].astype(float)

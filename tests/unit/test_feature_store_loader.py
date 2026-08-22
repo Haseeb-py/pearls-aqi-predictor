@@ -1,5 +1,6 @@
 import pandas as pd
 
+from pearls_aqi.features import store
 from pearls_aqi.features.store import load_training_data
 
 
@@ -58,3 +59,34 @@ def test_loader_combines_local_artifacts_before_city_filtering(tmp_path, monkeyp
     result = load_training_data("lahore")
 
     assert result["city_slug"].tolist() == ["lahore"]
+
+
+def test_hopsworks_upload_uses_registered_metadata_types(monkeypatch):
+    class FeatureGroup:
+        uploaded = None
+
+        def insert(self, dataframe, overwrite=False):
+            self.uploaded = dataframe
+
+    class Project:
+        def get_feature_store(self):
+            return object()
+
+    feature_group = FeatureGroup()
+    monkeypatch.setattr(store, "get_hopsworks_project", lambda: Project())
+    monkeypatch.setattr(store, "get_or_create_features_fg", lambda fs: feature_group)
+    monkeypatch.setattr(store, "get_or_create_features_fv", lambda fs, fg: object())
+    frame = pd.DataFrame(
+        {
+            "city_slug": ["lahore"],
+            "event_time_utc": [pd.Timestamp("2025-01-01T00:00:00Z")],
+            "ingested_at_utc": [pd.Timestamp("2025-01-01T00:00:00Z")],
+            "is_weekend": [0],
+            "aqi": [100],
+        }
+    )
+
+    store.upsert_features_df(frame)
+
+    assert feature_group.uploaded["ingested_at_utc"].dtype == object
+    assert feature_group.uploaded["is_weekend"].dtype == "int32"
