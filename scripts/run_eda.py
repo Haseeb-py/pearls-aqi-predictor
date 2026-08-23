@@ -7,7 +7,6 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import pandas as pd
 import seaborn as sns
 
 from pearls_aqi.features.store import load_training_data

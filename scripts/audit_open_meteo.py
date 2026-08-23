@@ -84,9 +84,9 @@ def run_audit():
 
     report_content = f"""# Open-Meteo Data Source Capability Report
 
-**Date of Audit:** {datetime.now().strftime('%Y-%m-%d')}  
-**Target Region:** Pakistan (Lahore, Karachi, Islamabad, Peshawar, Quetta)  
-**Standard Enforced:** US AQI (`us_aqi`)  
+**Date of Audit:** {datetime.now().strftime('%Y-%m-%d')}
+**Target Region:** Pakistan (Lahore, Karachi, Islamabad, Peshawar, Quetta)
+**Standard Enforced:** US AQI (`us_aqi`)
 **Data Attribution & Labeling:** ECMWF CAMS global air quality reanalysis/forecast modeled data via Open-Meteo API.
 
 ## 1. Lahore 1-Month Audit (2025-01-01 to 2025-01-31)

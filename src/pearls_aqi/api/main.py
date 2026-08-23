@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.copilot import chat
@@ -12,6 +13,13 @@ from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
 app = FastAPI(title="Pearls AQI Predictor")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")

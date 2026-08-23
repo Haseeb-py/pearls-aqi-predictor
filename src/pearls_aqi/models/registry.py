@@ -1,6 +1,7 @@
 """Local-first model registry with an optional Hopsworks upload."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -9,6 +10,8 @@ import joblib
 
 from pearls_aqi.features.store import get_hopsworks_project
 from pearls_aqi.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _artifact_dir(city_slug: str) -> Path:
@@ -41,13 +44,43 @@ def save_champion(
 
 
 def load_champion(city_slug: str) -> Tuple[Any, Dict[str, Any]]:
-    """Load the locally registered champion for inference."""
+    """Load a local champion, falling back to the latest Hopsworks model."""
     artifact_dir = _artifact_dir(city_slug)
     model_path = artifact_dir / "champion.joblib"
     metadata_path = artifact_dir / "champion.json"
-    if not model_path.exists() or not metadata_path.exists():
-        raise FileNotFoundError(f"No local champion registered for {city_slug}.")
-    return joblib.load(model_path), json.loads(metadata_path.read_text(encoding="utf-8"))
+    if model_path.exists() and metadata_path.exists():
+        return joblib.load(model_path), json.loads(metadata_path.read_text(encoding="utf-8"))
+    try:
+        project = get_hopsworks_project()
+        registry = project.get_model_registry()
+        models = registry.get_models(f"{settings.MODEL_NAME}_{city_slug}")
+        if not models:
+            raise FileNotFoundError(f"No Hopsworks champion registered for {city_slug}.")
+        latest_model = max(models, key=lambda item: int(item.version))
+        remote_dir = Path(latest_model.download())
+        remote_model_path = remote_dir / "champion.joblib"
+        remote_metadata_path = remote_dir / "champion.json"
+        if not remote_model_path.exists() or not remote_metadata_path.exists():
+            raise FileNotFoundError(f"Hopsworks model artifact for {city_slug} is incomplete.")
+        return joblib.load(remote_model_path), json.loads(remote_metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"No local champion registered for {city_slug}, and Hopsworks retrieval failed."
+        ) from exc
+
+
+def _registry_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
+    """Flatten nested evaluation metadata into Hopsworks' numeric metrics contract."""
+    flattened: Dict[str, float] = {}
+    for key, value in metrics.items():
+        name = f"{prefix}_{key}" if prefix else key
+        if isinstance(value, dict):
+            flattened.update(_registry_metrics(value, name))
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            flattened[name] = float(value)
+    return flattened
 
 
 def upload_champion_to_hopsworks(city_slug: str) -> bool:
@@ -59,10 +92,11 @@ def upload_champion_to_hopsworks(city_slug: str) -> bool:
         metadata = json.loads((artifact_dir / "champion.json").read_text(encoding="utf-8"))
         remote_model = registry.python.create_model(
             name=f"{settings.MODEL_NAME}_{city_slug}",
-            metrics=metadata["metrics"],
+            metrics=_registry_metrics(metadata["metrics"]),
             description="AQI forecasting champion; local artifact is source of truth.",
         )
         remote_model.save(str(artifact_dir), keep_original_files=True)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning("Hopsworks model upload failed for %s: %s", city_slug, type(exc).__name__)
         return False
