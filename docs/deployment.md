@@ -9,7 +9,7 @@ Streamlit Community Cloud can host the dashboard, but it is not a replacement
 for the FastAPI backend. Keeping them separate preserves the required FastAPI
 service and allows the API to scale independently.
 
-## 1. Deploy the API to Cloud Run
+## Option A: Deploy the API to Cloud Run
 
 From the repository root, after installing and authenticating the Google Cloud
 CLI:
@@ -59,3 +59,34 @@ must not end in a slash.
 $env:PYTHONPATH = "$PWD\src"
 .\venv\Scripts\python.exe scripts\verify_hopsworks.py
 ```
+
+## Option B: Deploy the API to Render (no Google Cloud required)
+
+Create a **Web Service** at [Render](https://render.com) from this GitHub
+repository. Use these exact values:
+
+| Render field | Value |
+|---|---|
+| Language | Python 3 |
+| Branch | `main` |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `PYTHONPATH=src uvicorn pearls_aqi.api.main:app --host 0.0.0.0 --port $PORT` |
+| Health Check Path | `/cities` |
+| Instance Type | Free (for demo) |
+
+Add these environment variables in Render's **Environment** page:
+
+```text
+HOPSWORKS_HOST=eu-west.cloud.hopsworks.ai
+HOPSWORKS_PROJECT=YOUR_PROJECT
+HOPSWORKS_API_KEY=YOUR_HOPSWORKS_API_KEY
+ALLOWED_ORIGINS=https://YOUR_APP.streamlit.app
+```
+
+Do not commit these values. Render uses the `.python-version` file to select
+Python 3.11. After deployment, copy the public `https://...onrender.com` URL
+and use it as `API_BASE_URL` in the Streamlit Community Cloud secrets.
+
+Render's free web service has 512 MB RAM and sleeps after 15 inactive minutes,
+so the first request can take around a minute. It is appropriate for a project
+demo, not high-availability production traffic.
