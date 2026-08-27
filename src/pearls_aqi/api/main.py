@@ -129,6 +129,32 @@ def _add_forecast_weather_features(
     return enriched
 
 
+def _prediction_value(
+    predictions: dict,
+    hours: int,
+    city: str,
+) -> float:
+    possible_targets = (
+        f"target_aqi+{hours}h",
+        f"target_aqi_{hours}h",
+    )
+    target = next((name for name in possible_targets if name in predictions), None)
+
+    if target is None:
+        logger.error(
+            "Prediction output missing horizon=%sh for city=%s. Available keys=%s",
+            hours,
+            city,
+            list(predictions.keys()),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Prediction output missing {hours}h forecast for {city}.",
+        )
+
+    return float(predictions[target][0])
+
+
 @app.get("/cities", response_model=list[CityConfig])
 def cities() -> list[dict]:
     return _enabled_cities()
@@ -193,8 +219,7 @@ def predict(city: str) -> ForecastResponse:
 
     forecasts = []
     for hours in (24, 48, 72):
-        target = f"target_aqi+{hours}h"
-        value = float(predictions[target][0])
+        value = _prediction_value(predictions, hours, city)
         category = get_us_aqi_category(value)
 
         forecasts.append(
