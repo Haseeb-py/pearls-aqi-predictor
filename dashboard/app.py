@@ -1,17 +1,25 @@
 """Presentation-ready Streamlit dashboard for Pearls AQI Predictor."""
 
+from datetime import timedelta
+
 import pandas as pd
 import requests
 import streamlit as st
 
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category, requires_health_alert
 from pearls_aqi.features.store import load_training_data
-from pearls_aqi.models.explain import explain_prediction, global_feature_importance, shap_feature_importance, shap_local_explanation
+from pearls_aqi.models.explain import (
+    explain_prediction,
+    global_feature_importance,
+    shap_feature_importance,
+    shap_local_explanation,
+)
 from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
 
 st.set_page_config(page_title="Pearls AQI Predictor", layout="wide")
+
 st.markdown("""<style>
     .stApp {background:#f4f7fb; color:#102a43;}
     .block-container {max-width:1440px; padding-top:2.4rem; padding-bottom:3rem;}
@@ -38,10 +46,18 @@ st.markdown("""<style>
 </style>""", unsafe_allow_html=True)
 
 
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+FORECAST_WEATHER_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "precipitation",
+]
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def prediction(city: str) -> dict:
-    # First request after an API restart can initialize the city's feature cache.
-    # A generous timeout avoids showing a false outage while that local work completes.
     response = requests.get(f"{settings.API_BASE_URL}/predict/{city}", timeout=35)
     response.raise_for_status()
     return response.json()
@@ -51,6 +67,54 @@ def prediction(city: str) -> dict:
 def recent_history(city: str) -> pd.DataFrame:
     df = load_training_data(city).tail(72)
     return df[["event_time_utc", "aqi", "pm2_5_ug_m3", "pm10_ug_m3", "wind_speed_10m_kph"]].copy()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def forecast_weather_features(city_slug: str, observed_at_iso: str) -> dict[str, float]:
+    city = next(item for item in cities if item["slug"] == city_slug)
+    observed_at = pd.Timestamp(observed_at_iso).to_pydatetime()
+
+    response = requests.get(
+        WEATHER_FORECAST_URL,
+        params={
+            "latitude": city["latitude"],
+            "longitude": city["longitude"],
+            "hourly": ",".join(FORECAST_WEATHER_VARIABLES),
+            "forecast_days": 4,
+            "timezone": "UTC",
+        },
+        timeout=12,
+    )
+    response.raise_for_status()
+
+    hourly = response.json().get("hourly", {})
+    times = pd.to_datetime(hourly.get("time", []), utc=True)
+    if times.empty:
+        raise ValueError("Open-Meteo forecast response did not contain hourly timestamps.")
+
+    features = {}
+    for horizon in (24, 48, 72):
+        target_time = observed_at + timedelta(hours=horizon)
+        nearest_idx = int(abs(times - target_time).argmin())
+        features[f"forecast_temperature_2m_c_{horizon}h"] = float(hourly["temperature_2m"][nearest_idx])
+        features[f"forecast_relative_humidity_2m_pct_{horizon}h"] = float(hourly["relative_humidity_2m"][nearest_idx])
+        features[f"forecast_surface_pressure_hpa_{horizon}h"] = float(hourly["surface_pressure"][nearest_idx])
+        features[f"forecast_wind_speed_10m_kph_{horizon}h"] = float(hourly["wind_speed_10m"][nearest_idx])
+        features[f"forecast_precipitation_mm_{horizon}h"] = float(hourly["precipitation"][nearest_idx])
+
+    return features
+
+
+def enrich_latest_for_analytics(city_slug: str, latest: pd.DataFrame) -> pd.DataFrame:
+    enriched = latest.copy()
+    observed_at = enriched.iloc[0]["event_time_utc"]
+    if not isinstance(observed_at, str):
+        observed_at = pd.Timestamp(observed_at).isoformat()
+
+    for column, value in forecast_weather_features(city_slug, observed_at).items():
+        enriched[column] = value
+
+    return enriched
 
 
 def trend_label(current: float, horizon: float) -> str:
@@ -82,8 +146,12 @@ def forecast_card(label: str, aqi: float, current: float, category: str | None =
 
 cities = [city for city in settings.load_cities_config()["cities"] if city.get("enabled", True)]
 labels = {city["name"]: city["slug"] for city in cities}
+
 st.markdown("""<div class="hero"><h1>Pearls AQI Predictor</h1><p>Three-day air-quality intelligence for Pakistan's major cities</p></div>""", unsafe_allow_html=True)
-overview_tab, comparison_tab, analytics_tab, copilot_tab = st.tabs(["Overview", "City comparison", "Model analytics", "AQI Copilot"])
+
+overview_tab, comparison_tab, analytics_tab, copilot_tab = st.tabs(
+    ["Overview", "City comparison", "Model analytics", "AQI Copilot"]
+)
 
 with overview_tab:
     st.markdown("<div class='section-kicker'>Forecast overview</div>", unsafe_allow_html=True)
@@ -91,6 +159,7 @@ with overview_tab:
     with left:
         city_name = st.selectbox("Select city", list(labels), label_visibility="collapsed")
     city_slug = labels[city_name]
+
     try:
         with st.spinner("Preparing the latest city forecast..."):
             data = prediction(city_slug)
@@ -98,18 +167,25 @@ with overview_tab:
     except (requests.RequestException, ValueError) as exc:
         st.error(f"Forecast unavailable: {exc}")
         st.stop()
+
     forecasts = data["forecasts"]
     current = float(data["current_aqi"])
     category = category_for(current)
+
     if data["is_stale"]:
         st.markdown("<div class='notice notice-stale'><strong>Stored-data notice.</strong> Observations are older than 30 hours; run the feature pipeline before using this operationally.</div>", unsafe_allow_html=True)
+
     if any(requires_health_alert(item["aqi"]) for item in forecasts):
         st.markdown("<div class='notice notice-alert'><strong>Health alert.</strong> At least one forecast reaches Unhealthy or worse. Follow local public-health guidance.</div>", unsafe_allow_html=True)
 
     metric_cols = st.columns(4)
     metric_cols[0].markdown(forecast_card("Current", current, current, category), unsafe_allow_html=True)
+
     for column, item in zip(metric_cols[1:], forecasts):
-        column.markdown(forecast_card(f"+{item['horizon_hours']} hours", item["aqi"], current, item["category"]), unsafe_allow_html=True)
+        column.markdown(
+            forecast_card(f"+{item['horizon_hours']} hours", item["aqi"], current, item["category"]),
+            unsafe_allow_html=True,
+        )
 
     color, _ = AQI_TONES[category]
     st.markdown(f"<div class='section-kicker' style='margin-top:1rem'>Selected city status <span style='color:{color}'>| {city_name}: {category}</span></div>", unsafe_allow_html=True)
@@ -119,9 +195,21 @@ with overview_tab:
         st.subheader("AQI history and forecast")
         historical = history.rename(columns={"event_time_utc": "time", "aqi": "AQI"})[["time", "AQI"]]
         forecast_frame = pd.DataFrame([{"time": item["valid_at_utc"], "AQI": item["aqi"]} for item in forecasts])
-        chart_data = pd.concat([historical, pd.DataFrame([{"time": data["latest_observation_at_utc"], "AQI": current}]), forecast_frame], ignore_index=True)
+        chart_data = pd.concat(
+            [
+                historical,
+                pd.DataFrame([{"time": data["latest_observation_at_utc"], "AQI": current}]),
+                forecast_frame,
+            ],
+            ignore_index=True,
+        )
         chart_data["time"] = pd.to_datetime(chart_data["time"], utc=True)
-        st.line_chart(chart_data.drop_duplicates("time", keep="last").set_index("time"), color="#126b66", height=310)
+        st.line_chart(
+            chart_data.drop_duplicates("time", keep="last").set_index("time"),
+            color="#126b66",
+            height=310,
+        )
+
     with insight_col:
         st.subheader("Forecast signal")
         st.markdown(f"<div class='aqi-card'><div class='eyebrow'>72-hour direction</div><h2>{trend_label(current, forecasts[-1]['aqi'])}</h2><p>{forecasts[-1]['aqi'] - current:+.1f} AQI vs. now</p></div>", unsafe_allow_html=True)
@@ -139,21 +227,39 @@ with overview_tab:
 
 with comparison_tab:
     st.markdown("<div class='section-kicker'>Cross-city outlook</div>", unsafe_allow_html=True)
+
     with st.spinner("Loading city forecasts..."):
         rows = []
         for name, slug in labels.items():
             try:
                 payload = prediction(slug)
                 values = [item["aqi"] for item in payload["forecasts"]]
-                rows.append({"City": name, "Status": category_for(payload["current_aqi"]), "Current": payload["current_aqi"], "24h": values[0], "48h": values[1], "72h": values[2], "Direction": trend_label(payload["current_aqi"], values[2])})
-            except (requests.RequestException, IndexError):
+                rows.append(
+                    {
+                        "City": name,
+                        "Status": category_for(payload["current_aqi"]),
+                        "Current": payload["current_aqi"],
+                        "24h": values[0],
+                        "48h": values[1],
+                        "72h": values[2],
+                        "Direction": trend_label(payload["current_aqi"], values[2]),
+                    }
+                )
+            except (requests.RequestException, IndexError, KeyError, ValueError):
                 continue
+
     if rows:
         comparison = pd.DataFrame(rows).sort_values("24h")
+
         def color_aqi(value):
             color, tint = AQI_TONES[category_for(value)]
             return f"background-color: {tint}; color: {color}; font-weight: 700"
-        st.dataframe(comparison.style.map(color_aqi, subset=["Current", "24h", "48h", "72h"]), use_container_width=True, hide_index=True)
+
+        st.dataframe(
+            comparison.style.map(color_aqi, subset=["Current", "24h", "48h", "72h"]),
+            use_container_width=True,
+            hide_index=True,
+        )
         st.subheader("Forecast comparison")
         st.bar_chart(comparison.set_index("City")[["24h", "48h", "72h"]], height=340)
     else:
@@ -162,14 +268,36 @@ with comparison_tab:
 with analytics_tab:
     st.markdown("<div class='section-kicker'>Model quality and explanations</div>", unsafe_allow_html=True)
     analytics_city = st.selectbox("Analytics city", list(labels), key="analytics_city")
+    analytics_slug = labels[analytics_city]
+
     try:
-        model, metadata = load_champion(labels[analytics_city])
-        training_data = load_training_data(labels[analytics_city])
+        model, metadata = load_champion(analytics_slug)
+        training_data = load_training_data(analytics_slug).sort_values("event_time_utc")
+        latest_features = enrich_latest_for_analytics(analytics_slug, training_data.iloc[[-1]])
+
         metrics = metadata["metrics"].get("per_horizon", metadata["metrics"])
-        st.dataframe(pd.DataFrame([{"Horizon": target.replace("target_aqi_", "+"), **values} for target, values in metrics.items()]), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Horizon": target.replace("target_aqi_", "+"), **values}
+                    for target, values in metrics.items()
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
         selections = metadata["metrics"].get("selection", {})
-        st.caption(" · ".join(f"{target.replace('target_aqi_', '+')}: {item['model']}" for target, item in selections.items()))
+        if selections:
+            st.caption(
+                " · ".join(
+                    f"{target.replace('target_aqi_', '+')}: {item['model']}"
+                    for target, item in selections.items()
+                )
+            )
+
         horizon = st.selectbox("Explanation horizon", [24, 48, 72])
+
         if st.button("Generate SHAP importance"):
             try:
                 importance = shap_feature_importance(model, training_data, horizon)
@@ -177,15 +305,23 @@ with analytics_tab:
             except Exception:
                 importance = global_feature_importance(model, training_data, horizon)
                 method = "Permutation importance fallback"
+
             st.caption(f"Method: {method}")
             st.bar_chart(pd.DataFrame(importance[:12]).set_index("feature"))
+
         try:
-            local = shap_local_explanation(model, training_data.iloc[[-1]], horizon)
-            st.dataframe(pd.DataFrame(local["contributions"][:10]), use_container_width=True, hide_index=True)
+            local = shap_local_explanation(model, latest_features, horizon)
         except Exception:
-            local = explain_prediction(model, training_data.iloc[[-1]], horizon)
+            local = explain_prediction(model, latest_features, horizon)
+
         st.caption(f"Latest local prediction (+{horizon}h): {local['prediction']:.1f} AQI")
-    except (FileNotFoundError, KeyError, ValueError) as exc:
+        st.dataframe(
+            pd.DataFrame(local["contributions"][:10]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    except (FileNotFoundError, KeyError, ValueError, requests.RequestException) as exc:
         st.info(f"Model analytics unavailable: {exc}")
 
 with copilot_tab:
@@ -208,8 +344,14 @@ with copilot_tab:
             st.markdown(turn["question"])
         with st.chat_message("assistant"):
             render_copilot_answer(turn["payload"])
-            events = ", ".join(f"{item['tool']} ({item['outcome']}, {item['latency_ms']} ms)" for item in turn["payload"].get("tool_events", [])) or "No tools required"
-            st.caption(f"Data generated: {turn['payload'].get('generated_at_utc', 'unavailable')} | {events} | Correlation ID: {turn['payload'].get('correlation_id', 'unavailable')}")
+            events = ", ".join(
+                f"{item['tool']} ({item['outcome']}, {item['latency_ms']} ms)"
+                for item in turn["payload"].get("tool_events", [])
+            ) or "No tools required"
+            st.caption(
+                f"Data generated: {turn['payload'].get('generated_at_utc', 'unavailable')} | "
+                f"{events} | Correlation ID: {turn['payload'].get('correlation_id', 'unavailable')}"
+            )
 
     example_prompts = [
         "What is Lahore's AQI forecast for the next three days?",
@@ -218,6 +360,7 @@ with copilot_tab:
         "Which supported city is expected to have the cleanest air tomorrow?",
         "Which city is forecast to improve the most over three days?",
     ]
+
     example_question = None
     with st.expander("Try an example question", expanded=False):
         for index, prompt in enumerate(example_prompts):
@@ -227,22 +370,38 @@ with copilot_tab:
     if example_question:
         st.session_state.copilot_draft = example_question
         st.rerun()
+
     if "copilot_draft" not in st.session_state:
         st.session_state.copilot_draft = ""
+
     with st.form("copilot_message_form", clear_on_submit=False):
-        st.text_input("Ask the AQI Copilot", placeholder="Ask about AQI in Lahore, Karachi...", key="copilot_draft", label_visibility="collapsed")
+        st.text_input(
+            "Ask the AQI Copilot",
+            placeholder="Ask about AQI in Lahore, Karachi...",
+            key="copilot_draft",
+            label_visibility="collapsed",
+        )
         ask_col, _ = st.columns([1, 7])
         with ask_col:
             ask_requested = st.form_submit_button("Ask Copilot", type="primary", use_container_width=True)
+
     question = st.session_state.copilot_draft.strip()
+
     if ask_requested and question:
         try:
             with st.spinner("Checking grounded forecast data..."):
                 history = [turn["question"] for turn in st.session_state.copilot_history[-6:]]
-                reply = requests.post(f"{settings.API_BASE_URL}/api/v1/copilot/chat", json={"message": question, "history": history}, timeout=35)
+                reply = requests.post(
+                    f"{settings.API_BASE_URL}/api/v1/copilot/chat",
+                    json={"message": question, "history": history},
+                    timeout=35,
+                )
                 reply.raise_for_status()
+
             payload = reply.json()
             st.session_state.copilot_history.append({"question": question, "payload": payload})
+            st.session_state.copilot_draft = ""
             st.rerun()
+
         except requests.RequestException as exc:
             st.error(f"Copilot unavailable: {exc}")
