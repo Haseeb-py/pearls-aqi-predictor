@@ -1,6 +1,7 @@
 """Minimal AQI prediction API."""
 
 from datetime import datetime, timedelta, timezone
+import logging
 
 import pandas as pd
 import requests
@@ -20,7 +21,17 @@ from pearls_aqi.features.store import load_training_data
 from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
+logger = logging.getLogger(__name__)
+
 WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+FORECAST_WEATHER_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "precipitation",
+]
+
 
 app = FastAPI(title="Pearls AQI Predictor")
 
@@ -39,11 +50,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 def warm_default_city_cache() -> None:
-    """Prepare the dashboard's default city before accepting requests."""
+    """Warm Lahore feature cache without making startup depend on it."""
     try:
         load_training_data("lahore")
     except Exception:
-        pass
+        logger.exception("Default city cache warmup failed; continuing startup.")
 
 
 def _enabled_cities() -> list[dict]:
@@ -54,60 +65,66 @@ def _enabled_cities() -> list[dict]:
     ]
 
 
-def _add_forecast_weather_features(
-    latest: pd.DataFrame,
-    city_config: dict,
-) -> pd.DataFrame:
-    """Add real Open-Meteo weather forecasts for target horizons."""
-    response = requests.get(
-        WEATHER_FORECAST_URL,
-        params={
-            "latitude": city_config["latitude"],
-            "longitude": city_config["longitude"],
-            "hourly": (
-                "temperature_2m,relative_humidity_2m,surface_pressure,"
-                "wind_speed_10m,precipitation"
-            ),
-            "forecast_days": 4,
-            "timezone": "UTC",
-        },
-        timeout=12,
-    )
-    response.raise_for_status()
-    hourly = response.json().get("hourly", {})
+def _city_config(city_slug: str) -> dict:
+    for city in _enabled_cities():
+        if city["slug"] == city_slug:
+            return city
+    raise HTTPException(status_code=404, detail=f"Unknown city: {city_slug}")
 
-    if not hourly or "time" not in hourly:
-        raise RuntimeError("Open-Meteo returned no hourly weather forecast.")
 
-    weather = pd.DataFrame(hourly)
-    weather["event_time_utc"] = pd.to_datetime(
-        weather["time"],
-        utc=True,
-    )
-
-    enriched = latest.copy()
-    observed_at = pd.Timestamp(enriched.iloc[0]["event_time_utc"])
-
-    feature_map = {
-        "temperature_2m": "forecast_temperature_2m_c",
-        "relative_humidity_2m": "forecast_relative_humidity_2m_pct",
-        "surface_pressure": "forecast_surface_pressure_hpa",
-        "wind_speed_10m": "forecast_wind_speed_10m_kph",
-        "precipitation": "forecast_precipitation_mm",
+def _fetch_forecast_weather(city: dict, observed_at: datetime) -> dict[str, float]:
+    params = {
+        "latitude": city["latitude"],
+        "longitude": city["longitude"],
+        "hourly": ",".join(FORECAST_WEATHER_VARIABLES),
+        "forecast_days": 4,
+        "timezone": "UTC",
     }
 
-    for hours in (24, 48, 72):
-        target_time = observed_at + pd.Timedelta(hours=hours)
-        matching = weather.loc[weather["event_time_utc"] == target_time]
+    response = requests.get(WEATHER_FORECAST_URL, params=params, timeout=12)
+    response.raise_for_status()
 
-        if matching.empty:
-            raise RuntimeError(
-                f"Open-Meteo has no weather forecast for +{hours}h."
-            )
+    hourly = response.json().get("hourly", {})
+    times = pd.to_datetime(hourly.get("time", []), utc=True)
 
-        row = matching.iloc[0]
-        for source_column, feature_prefix in feature_map.items():
-            enriched[f"{feature_prefix}_{hours}h"] = float(row[source_column])
+    if times.empty:
+        raise ValueError("Open-Meteo forecast response did not contain hourly timestamps.")
+
+    features: dict[str, float] = {}
+
+    for horizon in (24, 48, 72):
+        target_time = observed_at + timedelta(hours=horizon)
+        nearest_idx = int(abs(times - target_time).argmin())
+
+        features[f"forecast_temperature_2m_c_{horizon}h"] = float(
+            hourly["temperature_2m"][nearest_idx]
+        )
+        features[f"forecast_relative_humidity_2m_pct_{horizon}h"] = float(
+            hourly["relative_humidity_2m"][nearest_idx]
+        )
+        features[f"forecast_surface_pressure_hpa_{horizon}h"] = float(
+            hourly["surface_pressure"][nearest_idx]
+        )
+        features[f"forecast_wind_speed_10m_kph_{horizon}h"] = float(
+            hourly["wind_speed_10m"][nearest_idx]
+        )
+        features[f"forecast_precipitation_mm_{horizon}h"] = float(
+            hourly["precipitation"][nearest_idx]
+        )
+
+    return features
+
+
+def _add_forecast_weather_features(
+    latest: pd.DataFrame,
+    city: dict,
+    observed_at: datetime,
+) -> pd.DataFrame:
+    enriched = latest.copy()
+    forecast_features = _fetch_forecast_weather(city, observed_at)
+
+    for column, value in forecast_features.items():
+        enriched[column] = value
 
     return enriched
 
@@ -119,61 +136,65 @@ def cities() -> list[dict]:
 
 @app.get("/predict/{city}", response_model=ForecastResponse)
 def predict(city: str) -> ForecastResponse:
-    city_configs = {
-        item["slug"]: item
-        for item in _enabled_cities()
-    }
-
-    if city not in city_configs:
-        raise HTTPException(status_code=404, detail=f"Unknown city: {city}")
+    city = city.lower().strip()
+    city_cfg = _city_config(city)
 
     try:
         model, metadata = load_champion(city)
     except FileNotFoundError as exc:
+        logger.exception("No trained model available for city=%s", city)
         raise HTTPException(
             status_code=404,
             detail=f"No trained model available for {city}.",
         ) from exc
+    except Exception as exc:
+        logger.exception("Failed to load champion model for city=%s", city)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model registry unavailable for {city}.",
+        ) from exc
 
     try:
-        latest = load_training_data(city).iloc[[-1]]
+        latest = load_training_data(city).sort_values("event_time_utc").iloc[[-1]]
     except Exception as exc:
+        logger.exception("Failed to load prediction data for city=%s", city)
         raise HTTPException(
             status_code=503,
             detail=f"Prediction data unavailable for {city}.",
         ) from exc
 
+    observed_at = latest.iloc[0]["event_time_utc"].to_pydatetime()
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+
+    try:
+        latest = _add_forecast_weather_features(latest, city_cfg, observed_at)
+    except Exception as exc:
+        logger.exception("Failed to load forecast-weather data for city=%s", city)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Forecast-weather data unavailable for {city}; please try again shortly.",
+        ) from exc
+
     try:
         predictions = model.predict(latest)
     except KeyError as exc:
-        if "forecast_" not in str(exc):
-            raise HTTPException(
-                status_code=503,
-                detail=f"Prediction feature data unavailable for {city}.",
-            ) from exc
-
-        try:
-            latest = _add_forecast_weather_features(latest, city_configs[city])
-            predictions = model.predict(latest)
-        except Exception as weather_exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Forecast-weather data unavailable for {city}; "
-                    "please try again shortly."
-                ),
-            ) from weather_exc
-    except ValueError as exc:
+        logger.exception("Prediction feature mismatch for city=%s", city)
         raise HTTPException(
             status_code=503,
-            detail=f"Prediction feature data unavailable for {city}.",
+            detail=f"Prediction feature mismatch for {city}.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Prediction failed for city=%s", city)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Prediction failed for {city}.",
         ) from exc
 
-    observed_at = latest.iloc[0]["event_time_utc"].to_pydatetime()
     forecasts = []
-
     for hours in (24, 48, 72):
-        value = float(predictions[f"target_aqi+{hours}h"][0])
+        target = f"target_aqi+{hours}h"
+        value = float(predictions[target][0])
         category = get_us_aqi_category(value)
 
         forecasts.append(
@@ -191,6 +212,8 @@ def predict(city: str) -> ForecastResponse:
         issued_at_utc=observed_at,
         latest_observation_at_utc=observed_at,
         current_aqi=float(latest.iloc[0]["aqi"]),
+        aqi_standard=str(latest.iloc[0].get("aqi_standard", "us_aqi")),
+        data_label=str(latest.iloc[0].get("data_label", "modeled air-quality data")),
         model_name=metadata["model_name"],
         model_version=metadata["model_version"],
         forecasts=forecasts,
@@ -209,6 +232,7 @@ def copilot_chat(request: CopilotChatRequest) -> dict:
     try:
         return chat(request.message, request.cities, request.history)
     except (FileNotFoundError, ValueError) as exc:
+        logger.exception("Copilot evidence unavailable.")
         raise HTTPException(
             status_code=503,
             detail="Copilot evidence is temporarily unavailable.",
