@@ -374,7 +374,7 @@ with copilot_tab:
     if "copilot_draft" not in st.session_state:
         st.session_state.copilot_draft = ""
 
-    with st.form("copilot_message_form", clear_on_submit=False):
+    with st.form("copilot_message_form", clear_on_submit=True):
         st.text_input(
             "Ask the AQI Copilot",
             placeholder="Ask about AQI in Lahore, Karachi...",
