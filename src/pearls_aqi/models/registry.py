@@ -28,9 +28,12 @@ def save_champion(
     """Persist a local champion artifact and its serving metadata."""
     artifact_dir = _artifact_dir(city_slug)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+
     model_path = artifact_dir / "champion.joblib"
     metadata_path = artifact_dir / "champion.json"
+
     joblib.dump(model, model_path)
+
     metadata = {
         "city_slug": city_slug,
         "model_name": model_name,
@@ -39,8 +42,14 @@ def save_champion(
         "metrics": metrics,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"model_path": str(model_path), "metadata_path": str(metadata_path), **metadata}
+
+    return {
+        "model_path": str(model_path),
+        "metadata_path": str(metadata_path),
+        **metadata,
+    }
 
 
 def load_champion(city_slug: str) -> Tuple[Any, Dict[str, Any]]:
@@ -48,38 +57,51 @@ def load_champion(city_slug: str) -> Tuple[Any, Dict[str, Any]]:
     artifact_dir = _artifact_dir(city_slug)
     model_path = artifact_dir / "champion.joblib"
     metadata_path = artifact_dir / "champion.json"
+
     if model_path.exists() and metadata_path.exists():
         return joblib.load(model_path), json.loads(metadata_path.read_text(encoding="utf-8"))
+
     try:
         project = get_hopsworks_project()
         registry = project.get_model_registry()
+
         models = registry.get_models(f"{settings.MODEL_NAME}_{city_slug}")
         if not models:
             raise FileNotFoundError(f"No Hopsworks champion registered for {city_slug}.")
+
         latest_model = max(models, key=lambda item: int(item.version))
         remote_dir = Path(latest_model.download())
+
         remote_model_path = remote_dir / "champion.joblib"
         remote_metadata_path = remote_dir / "champion.json"
+
         if not remote_model_path.exists() or not remote_metadata_path.exists():
             raise FileNotFoundError(f"Hopsworks model artifact for {city_slug} is incomplete.")
-        return joblib.load(remote_model_path), json.loads(remote_metadata_path.read_text(encoding="utf-8"))
+
+        return joblib.load(remote_model_path), json.loads(
+            remote_metadata_path.read_text(encoding="utf-8")
+        )
+
     except FileNotFoundError:
         raise
     except Exception as exc:
-        raise FileNotFoundError(
-            f"No local champion registered for {city_slug}, and Hopsworks retrieval failed."
+        raise RuntimeError(
+            f"Hopsworks model registry retrieval failed for {city_slug}: {exc}"
         ) from exc
 
 
 def _registry_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
     """Flatten nested evaluation metadata into Hopsworks' numeric metrics contract."""
     flattened: Dict[str, float] = {}
+
     for key, value in metrics.items():
         name = f"{prefix}_{key}" if prefix else key
+
         if isinstance(value, dict):
             flattened.update(_registry_metrics(value, name))
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             flattened[name] = float(value)
+
     return flattened
 
 
@@ -88,8 +110,10 @@ def upload_champion_to_hopsworks(city_slug: str) -> bool:
     try:
         project = get_hopsworks_project()
         registry = project.get_model_registry()
+
         artifact_dir = _artifact_dir(city_slug)
         metadata = json.loads((artifact_dir / "champion.json").read_text(encoding="utf-8"))
+
         remote_model = registry.python.create_model(
             name=f"{settings.MODEL_NAME}_{city_slug}",
             metrics=_registry_metrics(metadata["metrics"]),
@@ -97,6 +121,11 @@ def upload_champion_to_hopsworks(city_slug: str) -> bool:
         )
         remote_model.save(str(artifact_dir), keep_original_files=True)
         return True
+
     except Exception as exc:
-        logger.warning("Hopsworks model upload failed for %s: %s", city_slug, type(exc).__name__)
+        logger.warning(
+            "Hopsworks model upload failed for %s: %s",
+            city_slug,
+            type(exc).__name__,
+        )
         return False
