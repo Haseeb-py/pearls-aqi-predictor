@@ -33,34 +33,49 @@ def _cached_local_training_data(city_slug: Optional[str], source_key: tuple[tupl
     return build_targets(build_features(df)).reset_index(drop=True)
 
 
-def get_hopsworks_project() -> Any:
-    """Login to Hopsworks using environment variables without printing secrets."""
-    if not settings.HOPSWORKS_API_KEY:
-        raise FeatureStoreError(
-            "HOPSWORKS_API_KEY is not set in environment or .env file."
-        )
-    if not settings.HOPSWORKS_PROJECT:
-        raise FeatureStoreError(
-            "HOPSWORKS_PROJECT is not set in environment or .env file."
-        )
-
-    tmp_dir = tempfile.gettempdir()
-    os.environ.setdefault("HOPSWORKS_TMP", tmp_dir)
-    os.environ.setdefault("HOME", tmp_dir)
-
+def get_hopsworks_project():
+    """Connect to Hopsworks with one reconnect attempt for cloud/serverless runtimes."""
     try:
         import hopsworks
+    except ImportError as exc:
+        raise FeatureStoreError("Hopsworks package is not installed.") from exc
 
-        project = hopsworks.login(
-            host=settings.HOPSWORKS_HOST,
-            project=settings.HOPSWORKS_PROJECT,
-            api_key_value=settings.HOPSWORKS_API_KEY,
-        )
-        return project
-    except Exception as exc:
-        raise FeatureStoreError(
-            f"Failed to connect to Hopsworks Feature Store: {exc}"
-        ) from exc
+    host = getattr(settings, "HOPSWORKS_HOST", None)
+    project = getattr(settings, "HOPSWORKS_PROJECT", None)
+    api_key = getattr(settings, "HOPSWORKS_API_KEY", None)
+
+    if not host or not project or not api_key:
+        raise FeatureStoreError("Hopsworks credentials are not configured.")
+
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            return hopsworks.login(
+                host=host,
+                project=project,
+                api_key_value=api_key,
+            )
+        except Exception as exc:
+            last_error = exc
+
+            # Hopsworks can leave a stale global client in serverless runtimes.
+            # A fresh import/client cycle on the second attempt usually fixes it.
+            try:
+                import hopsworks_common.client as hw_client
+
+                if hasattr(hw_client, "client"):
+                    hw_client.client._client = None
+            except Exception:
+                pass
+
+            if attempt == 0:
+                continue
+
+    raise FeatureStoreError(
+        f"Failed to connect to Hopsworks Feature Store: {last_error}"
+    ) from last_error
+
 
 
 def verify_hopsworks_connection() -> bool:
