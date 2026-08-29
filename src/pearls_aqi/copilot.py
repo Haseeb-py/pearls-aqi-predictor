@@ -10,7 +10,10 @@ from typing import Any, Callable
 import pandas as pd
 import requests
 
+from pearls_aqi.data.air_quality_provider import OpenMeteoAirQualityProvider
+from pearls_aqi.data.weather_provider import OpenMeteoWeatherProvider
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
+from pearls_aqi.features.builder import build_features
 from pearls_aqi.features.store import load_training_data
 from pearls_aqi.models.explain import explain_prediction, shap_local_explanation
 from pearls_aqi.models.registry import load_champion
@@ -44,6 +47,25 @@ def _value(row: pd.Series, key: str) -> float | None:
     return None if pd.isna(value) else round(float(value), 2)
 
 
+def _live_city_data(city: str) -> pd.DataFrame:
+    """Build a serving row from Open-Meteo instead of blocking on a Feature Store read."""
+    config = _cities()[city]
+    air = OpenMeteoAirQualityProvider(timeout_seconds=8, max_retries=1).fetch_current_air_quality(
+        config["latitude"], config["longitude"], past_days=7, forecast_days=1
+    )
+    weather = OpenMeteoWeatherProvider(timeout_seconds=8, max_retries=1).fetch_forecast_weather(
+        config["latitude"], config["longitude"], forecast_days=2
+    )
+    air["city_slug"] = city
+    features = build_features(air)
+    frame = features.merge(weather, on="event_time_utc", how="left", suffixes=("", "_forecast"))
+    cutoff = pd.Timestamp.now(tz="UTC").floor("h")
+    frame = frame.loc[frame["event_time_utc"] <= cutoff].sort_values("event_time_utc")
+    if frame.empty:
+        raise ValueError("Open-Meteo did not provide a current hourly observation.")
+    return frame.reset_index(drop=True)
+
+
 def _city_data(city: str) -> pd.DataFrame:
     if city not in _cities():
         raise ValueError(f"Unsupported city '{city}'.")
@@ -51,7 +73,11 @@ def _city_data(city: str) -> pd.DataFrame:
     cached = _CITY_DATA_CACHE.get(city)
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1].copy()
-    frame = load_training_data(city).sort_values("event_time_utc")
+    try:
+        frame = _live_city_data(city)
+    except Exception as exc:
+        logger.warning("Open-Meteo serving data unavailable for %s; using Feature Store fallback: %s", city, type(exc).__name__)
+        frame = load_training_data(city).sort_values("event_time_utc")
     _CITY_DATA_CACHE[city] = (now, frame)
     return frame.copy()
 
