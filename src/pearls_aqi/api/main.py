@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from pearls_aqi.copilot import chat
+from pearls_aqi.copilot import chat, warm_city_cache
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.domain.schemas import (
     CityConfig,
@@ -52,7 +52,7 @@ app.add_middleware(
 def warm_default_city_cache() -> None:
     """Warm Lahore feature cache without making startup depend on it."""
     try:
-        load_training_data("lahore")
+        warm_city_cache("lahore")
     except Exception:
         logger.exception("Default city cache warmup failed; continuing startup.")
 

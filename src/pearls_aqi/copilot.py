@@ -66,6 +66,11 @@ def _city_champion(city: str) -> tuple[Any, dict[str, Any]]:
 
 
 # The seven public tools required by the project specification.
+def warm_city_cache(city: str) -> None:
+    """Warm the common serving path during API startup, before user traffic."""
+    _city_data(city)
+    _city_champion(city)
+
 def get_current_aqi(city: str) -> dict[str, Any]:
     frame = _city_data(city)
     row = frame.iloc[-1]
