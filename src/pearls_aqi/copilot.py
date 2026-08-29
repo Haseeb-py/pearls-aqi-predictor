@@ -18,6 +18,12 @@ from pearls_aqi.settings import settings
 logger = logging.getLogger(__name__)
 STALE_AFTER_HOURS = 30
 MAX_HISTORY_MESSAGES = 6
+CACHE_TTL_SECONDS = 300
+
+# Reusing one city frame/model within a short window avoids duplicate
+# Hopsworks reads when a single question needs both current data and a forecast.
+_CITY_DATA_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_CHAMPION_CACHE: dict[str, tuple[float, tuple[Any, dict[str, Any]]]] = {}
 # The Copilot is deterministic rather than LLM-prompted.  This policy is the
 # equivalent response-style instruction: conversational lead, then evidence.
 RESPONSE_STYLE = "Lead with a natural, helpful sentence, then state grounded AQI data and its timestamp."
@@ -40,7 +46,23 @@ def _value(row: pd.Series, key: str) -> float | None:
 def _city_data(city: str) -> pd.DataFrame:
     if city not in _cities():
         raise ValueError(f"Unsupported city '{city}'.")
-    return load_training_data(city)
+    now = time.monotonic()
+    cached = _CITY_DATA_CACHE.get(city)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1].copy()
+    frame = load_training_data(city).sort_values("event_time_utc")
+    _CITY_DATA_CACHE[city] = (now, frame)
+    return frame.copy()
+
+
+def _city_champion(city: str) -> tuple[Any, dict[str, Any]]:
+    now = time.monotonic()
+    cached = _CHAMPION_CACHE.get(city)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1]
+    champion = load_champion(city)
+    _CHAMPION_CACHE[city] = (now, champion)
+    return champion
 
 
 # The seven public tools required by the project specification.
@@ -61,7 +83,7 @@ def get_current_aqi(city: str) -> dict[str, Any]:
 
 def get_aqi_forecast(city: str) -> dict[str, Any]:
     frame = _city_data(city)
-    model, _ = load_champion(city)
+    model, _ = _city_champion(city)
     row = frame.iloc[[-1]]
     issued_at = row.iloc[0]["event_time_utc"]
     predictions = model.predict(row)
@@ -102,7 +124,7 @@ def get_aqi_history(city: str, hours: int = 72) -> dict[str, Any]:
 def explain_city_prediction(city: str, horizon_hours: int = 24) -> dict[str, Any]:
     if horizon_hours not in (24, 48, 72):
         raise ValueError("Explanation horizon must be 24, 48, or 72 hours.")
-    model, _ = load_champion(city)
+    model, _ = _city_champion(city)
     row = _city_data(city).iloc[[-1]]
     try:
         explanation = shap_local_explanation(model, row, horizon_hours)
