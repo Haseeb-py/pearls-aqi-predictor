@@ -149,11 +149,14 @@ labels = {city["name"]: city["slug"] for city in cities}
 
 st.markdown("""<div class="hero"><h1>Pearls AQI Predictor</h1><p>Three-day air-quality intelligence for Pakistan's major cities</p></div>""", unsafe_allow_html=True)
 
-overview_tab, comparison_tab, analytics_tab, copilot_tab = st.tabs(
-    ["Overview", "City comparison", "Model analytics", "AQI Copilot"]
+selected_page = st.radio(
+    "Navigation",
+    ["Overview", "City comparison", "Model analytics", "AQI Copilot"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-with overview_tab:
+if selected_page == "Overview":
     st.markdown("<div class='section-kicker'>Forecast overview</div>", unsafe_allow_html=True)
     left, right = st.columns([1, 3])
     with left:
@@ -225,7 +228,7 @@ with overview_tab:
     env[3].metric("Model", "Per-horizon champion")
     st.caption(f"Latest observation: {data['latest_observation_at_utc']} · Open-Meteo/CAMS modeled data · {data['model_name']} v{data['model_version']}")
 
-with comparison_tab:
+if selected_page == "City comparison":
     st.markdown("<div class='section-kicker'>Cross-city outlook</div>", unsafe_allow_html=True)
 
     with st.spinner("Loading city forecasts..."):
@@ -265,7 +268,7 @@ with comparison_tab:
     else:
         st.info("No city forecasts are currently available.")
 
-with analytics_tab:
+if selected_page == "Model analytics":
     st.markdown("<div class='section-kicker'>Model quality and explanations</div>", unsafe_allow_html=True)
     analytics_city = st.selectbox("Analytics city", list(labels), key="analytics_city")
     analytics_slug = labels[analytics_city]
@@ -324,7 +327,7 @@ with analytics_tab:
     except (FileNotFoundError, KeyError, ValueError, requests.RequestException) as exc:
         st.info(f"Model analytics unavailable: {exc}")
 
-with copilot_tab:
+if selected_page == "AQI Copilot":
     if "copilot_history" not in st.session_state:
         st.session_state.copilot_history = []
 
