@@ -4,10 +4,11 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pandas as pd
+import requests
 
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.features.store import load_training_data
@@ -66,6 +67,61 @@ def _city_champion(city: str) -> tuple[Any, dict[str, Any]]:
 
 
 # The seven public tools required by the project specification.
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+FORECAST_WEATHER_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "precipitation",
+]
+
+
+def _add_forecast_weather_features(
+    row: pd.DataFrame,
+    city: str,
+    issued_at: pd.Timestamp,
+) -> pd.DataFrame:
+    """Add the target-time weather fields required by 48h/72h champions."""
+    city_config = _cities()[city]
+    response = requests.get(
+        WEATHER_FORECAST_URL,
+        params={
+            "latitude": city_config["latitude"],
+            "longitude": city_config["longitude"],
+            "hourly": ",".join(FORECAST_WEATHER_VARIABLES),
+            "forecast_days": 4,
+            "timezone": "UTC",
+        },
+        timeout=12,
+    )
+    response.raise_for_status()
+    hourly = response.json().get("hourly", {})
+    times = pd.to_datetime(hourly.get("time", []), utc=True)
+    if times.empty:
+        raise ValueError("Open-Meteo forecast response did not contain hourly timestamps.")
+
+    enriched = row.copy()
+    mappings = {
+        "temperature_2m": "forecast_temperature_2m_c",
+        "relative_humidity_2m": "forecast_relative_humidity_2m_pct",
+        "surface_pressure": "forecast_surface_pressure_hpa",
+        "wind_speed_10m": "forecast_wind_speed_10m_kph",
+        "precipitation": "forecast_precipitation_mm",
+    }
+    for horizon in (24, 48, 72):
+        nearest_idx = int(abs(times - (issued_at + pd.Timedelta(hours=horizon))).argmin())
+        for source_name, feature_prefix in mappings.items():
+            enriched[f"{feature_prefix}_{horizon}h"] = float(hourly[source_name][nearest_idx])
+    return enriched
+
+
+def _prediction_value(predictions: dict[str, Any], hours: int) -> float:
+    for target in (f"target_aqi_{hours}h", f"target_aqi+{hours}h"):
+        if target in predictions:
+            return float(predictions[target][0])
+    raise KeyError(f"Prediction output does not contain the {hours}h horizon.")
+
 def warm_city_cache(city: str) -> None:
     """Warm the common serving path during API startup, before user traffic."""
     _city_data(city)
@@ -90,7 +146,8 @@ def get_aqi_forecast(city: str) -> dict[str, Any]:
     frame = _city_data(city)
     model, _ = _city_champion(city)
     row = frame.iloc[[-1]]
-    issued_at = row.iloc[0]["event_time_utc"]
+    issued_at = pd.Timestamp(row.iloc[0]["event_time_utc"])
+    row = _add_forecast_weather_features(row, city, issued_at)
     predictions = model.predict(row)
     return {
         "city": city,
@@ -100,8 +157,8 @@ def get_aqi_forecast(city: str) -> dict[str, Any]:
             {
                 "horizon_hours": hours,
                 "valid_at_utc": (issued_at + pd.Timedelta(hours=hours)).isoformat(),
-                "aqi": round(float(predictions[f"target_aqi_{hours}h"][0]), 1),
-                "category": get_us_aqi_category(float(predictions[f"target_aqi_{hours}h"][0])).category,
+                "aqi": round(_prediction_value(predictions, hours), 1),
+                "category": get_us_aqi_category(_prediction_value(predictions, hours)).category,
             }
             for hours in (24, 48, 72)
         ],
@@ -131,6 +188,8 @@ def explain_city_prediction(city: str, horizon_hours: int = 24) -> dict[str, Any
         raise ValueError("Explanation horizon must be 24, 48, or 72 hours.")
     model, _ = _city_champion(city)
     row = _city_data(city).iloc[[-1]]
+    issued_at = pd.Timestamp(row.iloc[0]["event_time_utc"])
+    row = _add_forecast_weather_features(row, city, issued_at)
     try:
         explanation = shap_local_explanation(model, row, horizon_hours)
         factors = [{"feature": item["feature"], "contribution": round(float(item["shap_value"]), 3)} for item in explanation["contributions"][:5]]
