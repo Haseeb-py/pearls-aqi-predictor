@@ -403,7 +403,6 @@ if selected_page == "AQI Copilot":
 
             payload = reply.json()
             st.session_state.copilot_history.append({"question": question, "payload": payload})
-            st.session_state.copilot_draft = ""
             st.rerun()
 
         except requests.RequestException as exc:
