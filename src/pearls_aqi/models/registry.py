@@ -2,7 +2,6 @@
 
 import json
 import logging
-from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -53,7 +52,6 @@ def save_champion(
     }
 
 
-@lru_cache(maxsize=12)
 def load_champion(city_slug: str) -> Tuple[Any, Dict[str, Any]]:
     """Load a local champion, falling back to the latest Hopsworks model."""
     artifact_dir = _artifact_dir(city_slug)

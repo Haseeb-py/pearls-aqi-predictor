@@ -299,6 +299,46 @@ def _off_topic(text: str) -> bool:
     return any(term in text for term in ("poem", "capital of france", "write code", "recipe", "joke")) and "aqi" not in text and "air" not in text
 
 
+def _crisis_response() -> str:
+    """Return a no-tool, Pakistan-specific crisis response."""
+    return (
+        "I'm really sorry you're dealing with this. You deserve immediate support, "
+        "and I can't safely handle this as an AQI question.\n\n"
+        "If you might act on these thoughts or are in immediate danger, call Rescue 1122 "
+        "or go to the nearest emergency department now. If you can, stay with someone "
+        "you trust and ask them to help you make that call.\n\n"
+        "For confidential mental-health support in Pakistan, Umang is available at "
+        "0311-7786264 (0311-77UMANG). You can also contact the National Youth Helpline "
+        "at 0800-69457."
+    )
+
+
+def _is_crisis_message(text: str) -> bool:
+    """Detect direct self-harm or suicide statements before every other route."""
+    patterns = (
+        r"\b(kill|hurt|harm) myself\b", r"\bend my life\b", r"\bwant to die\b",
+        r"\bdon'?t want to live\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _has_aqi_intent(message: str, history: list[str]) -> bool:
+    """Classify the whole turn before city names are considered."""
+    text = message.lower()
+    direct_terms = (
+        "aqi", "air quality", "air pollution", "pollution", "pollutant", "pm2", "pm10",
+        "ozone", "nitrogen dioxide", "carbon monoxide", "sulphur dioxide", "sulfur dioxide",
+        "weather", "temperature", "humidity", "wind", "rain", "precipitation", "pressure",
+        "forecast", "air looking", "how's the air", "hows the air", "air today",
+    )
+    if any(term in text for term in direct_terms):
+        return True
+    activity_question = any(term in text for term in ("jog", "run", "walk", "exercise", "workout", "outdoors"))
+    asks_permission = any(term in text for term in ("can i", "should i", "is it safe", "safe to", "today", "tomorrow"))
+    if activity_question and asks_permission:
+        return True
+    return bool(re.search(r"\bwhat about\b", text) and history and _has_aqi_intent(history[-1], []))
+
 def _resolve_cities(message: str, requested: list[str], history: list[str]) -> tuple[list[str], str | None]:
     text = message.lower()
     allowed = _cities()
@@ -376,10 +416,10 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
         return f"{city.title()} changed {change:+.1f} AQI over the last {evidence['history']['hours']} stored hours.\n\nIt moved from {points[0]['aqi']:.1f} to {points[-1]['aqi']:.1f}. Historical data ends at {points[-1]['time']}." + _stale_notice(evidence["history"])
     if "weather" in evidence:
         weather = evidence["weather"]
-        return f"{city.title()} is {weather['temperature_c']}°C with {weather['humidity_pct']}% humidity.\n\nWind is {weather['wind_kph']} km/h and precipitation is {weather['precipitation_mm']} mm. Stored observation: {weather['observed_at_utc']}." + _stale_notice(weather)
+        return f"{city.title()} is {weather['temperature_c']}Â°C with {weather['humidity_pct']}% humidity.\n\nWind is {weather['wind_kph']} km/h and precipitation is {weather['precipitation_mm']} mm. Stored observation: {weather['observed_at_utc']}." + _stale_notice(weather)
     if "pollutants" in evidence:
         p = evidence["pollutants"]
-        return f"For {city.title()}, PM2.5 is {p['pm2_5']} µg/m³ and PM10 is {p['pm10']} µg/m³.\n\nNO₂ is {p['no2']} µg/m³ and ozone is {p['ozone']} µg/m³. Stored observation: {p['observed_at_utc']}." + _stale_notice(p)
+        return f"For {city.title()}, PM2.5 is {p['pm2_5']} Âµg/mÂ³ and PM10 is {p['pm10']} Âµg/mÂ³.\n\nNOâ‚‚ is {p['no2']} Âµg/mÂ³ and ozone is {p['ozone']} Âµg/mÂ³. Stored observation: {p['observed_at_utc']}." + _stale_notice(p)
     if "explanation" in evidence:
         e = evidence["explanation"]
         factors = ", ".join(item["feature"] for item in e["top_factors"][:3]) or "the selected model features"
@@ -414,9 +454,14 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
     correlation_id = uuid.uuid4().hex
     history = (history or [])[-MAX_HISTORY_MESSAGES:]
     text = message.strip()
-    if _injection_or_internal_request(text.lower()):
+    lower = text.lower()
+    if not settings.COPILOT_ENABLED:
+        return {"answer": "AQI Copilot is currently disabled by configuration.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+    if _is_crisis_message(lower):
+        return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+    if _injection_or_internal_request(lower):
         return {"answer": "I can help with supported AQI information, but I cannot reveal internal instructions or bypass grounding and safety rules.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
-    if _off_topic(text.lower()):
+    if _off_topic(lower) or not _has_aqi_intent(text, history):
         return {"answer": "I am limited to supported AQI, weather, pollutant, forecast, history, and model-explanation questions for this project.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     cities, clarification = _resolve_cities(text, requested_cities or [], history)
     if clarification:
@@ -440,7 +485,7 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         pollutant_terms = ("pm2", "pm10", "pollutant", "ozone", "no2", "so2", "carbon monoxide")
         history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical")
         explanation_terms = ("explain", "shap", "feature importance", "predicted high")
-        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "exercise", "workout"))
+        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "exercise", "workout")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
         if needs_status:
             plan.extend([("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))])
         if any(term in lower for term in weather_terms):
@@ -452,8 +497,7 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         if any(term in lower for term in explanation_terms) or ("predicted" in lower and "high" in lower):
             horizon = 72 if "72" in lower else 48 if "48" in lower else 24
             plan.append(("explanation", "explain_prediction", (city, horizon)))
-        if not plan:
-            plan = [("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))]
+
         for key, tool, args in plan:
             result, event = _run_tool(correlation_id, tool, *args)
             events.append(event)
