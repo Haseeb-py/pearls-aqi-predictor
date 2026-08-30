@@ -14,6 +14,11 @@ __pycache__/
 # Generated local data, models, plots, and browser profiles
 artifacts/data/
 artifacts/models/
+!artifacts/
+!artifacts/models/
+!artifacts/models/*/
+!artifacts/models/*/champion.joblib
+!artifacts/models/*/champion.json
 artifacts/eda/
 artifacts/experiments/
 artifacts/chrome-headless-profile*/

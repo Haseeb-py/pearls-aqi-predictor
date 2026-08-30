@@ -54,11 +54,24 @@ def _live_city_data(city: str) -> pd.DataFrame:
         config["latitude"], config["longitude"], past_days=7, forecast_days=1
     )
     weather = OpenMeteoWeatherProvider(timeout_seconds=8, max_retries=1).fetch_forecast_weather(
-        config["latitude"], config["longitude"], forecast_days=2
+        config["latitude"], config["longitude"], forecast_days=4
     )
     air["city_slug"] = city
     features = build_features(air)
     frame = features.merge(weather, on="event_time_utc", how="left", suffixes=("", "_forecast"))
+    weather_times = pd.to_datetime(weather["event_time_utc"], utc=True)
+    weather_columns = {
+        "temperature_2m_c": "forecast_temperature_2m_c",
+        "relative_humidity_2m_pct": "forecast_relative_humidity_2m_pct",
+        "surface_pressure_hpa": "forecast_surface_pressure_hpa",
+        "wind_speed_10m_kph": "forecast_wind_speed_10m_kph",
+        "precipitation_mm": "forecast_precipitation_mm",
+    }
+    issued_at = pd.Timestamp.now(tz="UTC").floor("h")
+    for horizon in (24, 48, 72):
+        nearest_idx = int(abs(weather_times - (issued_at + pd.Timedelta(hours=horizon))).argmin())
+        for source, target in weather_columns.items():
+            frame[f"{target}_{horizon}h"] = float(weather.iloc[nearest_idx][source])
     cutoff = pd.Timestamp.now(tz="UTC").floor("h")
     frame = frame.loc[frame["event_time_utc"] <= cutoff].sort_values("event_time_utc")
     if frame.empty:
@@ -109,6 +122,20 @@ def _add_forecast_weather_features(
     issued_at: pd.Timestamp,
 ) -> pd.DataFrame:
     """Add the target-time weather fields required by 48h/72h champions."""
+    required = [
+        f"{prefix}_{horizon}h"
+        for prefix in (
+            "forecast_temperature_2m_c",
+            "forecast_relative_humidity_2m_pct",
+            "forecast_surface_pressure_hpa",
+            "forecast_wind_speed_10m_kph",
+            "forecast_precipitation_mm",
+        )
+        for horizon in (24, 48, 72)
+    ]
+    if set(required).issubset(row.columns):
+        return row.copy()
+
     city_config = _cities()[city]
     response = requests.get(
         WEATHER_FORECAST_URL,

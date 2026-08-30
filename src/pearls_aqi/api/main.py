@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from pearls_aqi.copilot import chat, warm_city_cache
+from pearls_aqi.copilot import _city_data, chat, warm_city_cache
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.domain.schemas import (
     CityConfig,
@@ -17,7 +17,6 @@ from pearls_aqi.domain.schemas import (
     ForecastHorizonOutput,
     ForecastResponse,
 )
-from pearls_aqi.features.store import load_training_data
 from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
@@ -120,12 +119,41 @@ def _add_forecast_weather_features(
     city: dict,
     observed_at: datetime,
 ) -> pd.DataFrame:
+    """Ensure all champion-required forecast-weather columns are present."""
     enriched = latest.copy()
-    forecast_features = _fetch_forecast_weather(city, observed_at)
+    required = [
+        f"{prefix}_{horizon}h"
+        for prefix in (
+            "forecast_temperature_2m_c",
+            "forecast_relative_humidity_2m_pct",
+            "forecast_surface_pressure_hpa",
+            "forecast_wind_speed_10m_kph",
+            "forecast_precipitation_mm",
+        )
+        for horizon in (24, 48, 72)
+    ]
+    if set(required).issubset(enriched.columns):
+        return enriched
+
+    try:
+        forecast_features = _fetch_forecast_weather(city, observed_at)
+    except requests.RequestException:
+        logger.warning("Open-Meteo forecast unavailable for %s; using latest weather values.", city["slug"])
+        fallback_columns = {
+            "temperature_2m_c": "forecast_temperature_2m_c",
+            "relative_humidity_2m_pct": "forecast_relative_humidity_2m_pct",
+            "surface_pressure_hpa": "forecast_surface_pressure_hpa",
+            "wind_speed_10m_kph": "forecast_wind_speed_10m_kph",
+            "precipitation_mm": "forecast_precipitation_mm",
+        }
+        forecast_features = {
+            f"{target}_{horizon}h": float(enriched.iloc[0][source])
+            for source, target in fallback_columns.items()
+            for horizon in (24, 48, 72)
+        }
 
     for column, value in forecast_features.items():
         enriched[column] = value
-
     return enriched
 
 
@@ -181,7 +209,7 @@ def predict(city: str) -> ForecastResponse:
         ) from exc
 
     try:
-        latest = load_training_data(city).sort_values("event_time_utc").iloc[[-1]]
+        latest = _city_data(city).iloc[[-1]]
     except Exception as exc:
         logger.exception("Failed to load prediction data for city=%s", city)
         raise HTTPException(

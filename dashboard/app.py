@@ -1,5 +1,6 @@
 """Presentation-ready Streamlit dashboard for Pearls AQI Predictor."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
 import pandas as pd
@@ -228,14 +229,17 @@ if selected_page == "Overview":
     env[3].metric("Model", "Per-horizon champion")
     st.caption(f"Latest observation: {data['latest_observation_at_utc']} · Open-Meteo/CAMS modeled data · {data['model_name']} v{data['model_version']}")
 
-if selected_page == "City comparison":
-    st.markdown("<div class='section-kicker'>Cross-city outlook</div>", unsafe_allow_html=True)
-
-    with st.spinner("Loading city forecasts..."):
-        rows = []
-        for name, slug in labels.items():
+@st.cache_data(ttl=120, show_spinner=False)
+def comparison_predictions(city_pairs: tuple[tuple[str, str], ...]) -> tuple[list[dict], list[str]]:
+    """Fetch city forecasts concurrently without overwhelming the API service."""
+    rows: list[dict] = []
+    unavailable: list[str] = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(prediction, slug): name for name, slug in city_pairs}
+        for future in as_completed(futures):
+            name = futures[future]
             try:
-                payload = prediction(slug)
+                payload = future.result()
                 values = [item["aqi"] for item in payload["forecasts"]]
                 rows.append(
                     {
@@ -249,7 +253,17 @@ if selected_page == "City comparison":
                     }
                 )
             except (requests.RequestException, IndexError, KeyError, ValueError):
-                continue
+                unavailable.append(name)
+    return rows, sorted(unavailable)
+
+
+if selected_page == "City comparison":
+    st.markdown("<div class='section-kicker'>Cross-city outlook</div>", unsafe_allow_html=True)
+    with st.spinner("Loading city forecasts..."):
+        rows, unavailable = comparison_predictions(tuple(labels.items()))
+
+    if unavailable:
+        st.warning("Forecasts are temporarily unavailable for: " + ", ".join(unavailable) + ".")
 
     if rows:
         comparison = pd.DataFrame(rows).sort_values("24h")
