@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = Field(default="llama-3.3-70b-versatile")
     GROQ_API_KEY: Optional[str] = Field(default=None)
     COPILOT_ENABLED: bool = Field(default=True)
+    SHOW_COPILOT_DEBUG: bool = Field(default=False)
 
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
     CONFIG_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent.parent / "config")

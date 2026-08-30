@@ -317,7 +317,8 @@ def _is_crisis_message(text: str) -> bool:
     """Detect direct self-harm or suicide statements before every other route."""
     patterns = (
         r"\b(kill|hurt|harm) myself\b", r"\bend my life\b", r"\bwant to die\b",
-        r"\bdon'?t want to live\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
+        r"\bdon'?t want to (live|be alive)\b", r"\blife (is not|isn'?t) worth living\b",
+        r"\b(easiest|best) way to (just )?end it\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
     )
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -326,7 +327,7 @@ def _has_aqi_intent(message: str, history: list[str]) -> bool:
     """Classify the whole turn before city names are considered."""
     text = message.lower()
     direct_terms = (
-        "aqi", "air quality", "air pollution", "pollution", "pollutant", "pm2", "pm10",
+        "aqi", "air quality", "air pollution", "pollution", "pollutant", "smog", "pm2", "pm10",
         "ozone", "nitrogen dioxide", "carbon monoxide", "sulphur dioxide", "sulfur dioxide",
         "weather", "temperature", "humidity", "wind", "rain", "precipitation", "pressure",
         "forecast", "air looking", "how's the air", "hows the air", "air today",
@@ -427,7 +428,7 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
     if current and forecast:
         forecast_values = {item["horizon_hours"]: item["aqi"] for item in forecast["forecasts"]}
         asks_activity = any(term in text for term in ("jog", "run", "exercise", "workout", "outdoor activity"))
-        asks_aqi_definition = "aqi" in text and any(term in text for term in ("what is", "what's the deal", "what is the deal", "mean", "stand for", "anyway"))
+        asks_aqi_definition = "aqi" in text and any(term in text for term in ("what's the deal", "what is the deal", "mean", "stand for", "anyway"))
         values = _forecast_summary(forecast["forecasts"])
         if asks_activity or asks_aqi_definition:
             parts = [
@@ -445,7 +446,12 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
             change = forecast_values[72] - current["aqi"]
             direction = "worsening" if change > 5 else "improving" if change < -5 else "broadly stable"
             return f"{city.title()} is forecast to be {direction} over the next three days.\n\nCurrent AQI is {current['aqi']:.1f} ({current['category']}); the 72-hour forecast is {forecast_values[72]:.1f} ({change:+.1f}). This forecast does not prove a specific emissions source.\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
-        return f"{city.title()} is currently in the {current['category']} range, with a stored AQI of {current['aqi']:.1f}.\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
+        if "tomorrow" in text or "24 hour" in text or "24h" in text:
+            first = forecast_values[24]
+            return f"For tomorrow, {city.title()} is forecast at {first:.1f} AQI ({forecast['forecasts'][0]['category']}).\n\nIt is {current['aqi']:.1f} AQI now ({current['category']}).\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
+        if any(term in text for term in ("how", "looking", "air today")):
+            return f"Right now, {city.title()}'s air is in the {current['category']} range at {current['aqi']:.1f} AQI.\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
+        return f"{city.title()} is currently in the {current['category']} range at the latest stored reading: {current['aqi']:.1f} AQI.\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
     return "The requested AQI data is unavailable, so I cannot provide a number."
 
 
@@ -485,7 +491,7 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         pollutant_terms = ("pm2", "pm10", "pollutant", "ozone", "no2", "so2", "carbon monoxide")
         history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical")
         explanation_terms = ("explain", "shap", "feature importance", "predicted high")
-        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "exercise", "workout")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
+        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "exercise", "workout", "pollution", "smog")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
         if needs_status:
             plan.extend([("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))])
         if any(term in lower for term in weather_terms):

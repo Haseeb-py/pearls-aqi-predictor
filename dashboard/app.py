@@ -354,21 +354,26 @@ if selected_page == "AQI Copilot":
         st.markdown(answer)
         if marker:
             st.warning(f"Data freshness:{freshness}")
-        st.caption(f"Source: {payload['provider']} | Tools: {', '.join(payload['tools_used']) or 'No tools required'}")
+        if settings.SHOW_COPILOT_DEBUG:
+            st.caption(
+                f"Source: {payload['provider']} | Tools: "
+                f"{', '.join(payload['tools_used']) or 'No tools required'}"
+            )
 
     for turn in st.session_state.copilot_history:
         with st.chat_message("user"):
             st.markdown(turn["question"])
         with st.chat_message("assistant"):
             render_copilot_answer(turn["payload"])
-            events = ", ".join(
-                f"{item['tool']} ({item['outcome']}, {item['latency_ms']} ms)"
-                for item in turn["payload"].get("tool_events", [])
-            ) or "No tools required"
-            st.caption(
-                f"Data generated: {turn['payload'].get('generated_at_utc', 'unavailable')} | "
-                f"{events} | Correlation ID: {turn['payload'].get('correlation_id', 'unavailable')}"
-            )
+            if settings.SHOW_COPILOT_DEBUG:
+                events = ", ".join(
+                    f"{item['tool']} ({item['outcome']}, {item['latency_ms']} ms)"
+                    for item in turn["payload"].get("tool_events", [])
+                ) or "No tools required"
+                st.caption(
+                    f"Data generated: {turn['payload'].get('generated_at_utc', 'unavailable')} | "
+                    f"{events} | Correlation ID: {turn['payload'].get('correlation_id', 'unavailable')}"
+                )
 
     example_prompts = [
         "What is Lahore's AQI forecast for the next three days?",
