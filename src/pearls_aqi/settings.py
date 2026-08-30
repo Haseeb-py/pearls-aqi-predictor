@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = Field(default="http://localhost:8501")
 
     LLM_PROVIDER: str = Field(default="groq")
-    GROQ_MODEL: str = Field(default="llama-3.3-70b-versatile")
+    GROQ_MODEL: str = Field(default="openai/gpt-oss-120b")
     GROQ_API_KEY: Optional[str] = Field(default=None)
     COPILOT_ENABLED: bool = Field(default=True)
     SHOW_COPILOT_DEBUG: bool = Field(default=False)

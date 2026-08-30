@@ -374,50 +374,155 @@ def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
     return False
 
 def _llm_crisis_assessment(message: str, history: list[str]) -> bool | None:
-    """Use Groq for a small semantic risk classification before tool routing."""
-    if settings.APP_ENV.lower() != "production" or not settings.GROQ_API_KEY:
-        return None
+    """Classify self-harm risk with Groq before every production routing decision."""
     payload = {
         "current_message": message,
         "recent_messages": history[-3:],
-        "task": (
-            "Classify genuine self-harm or suicide risk. Return JSON only with a risk boolean. "
-            "Mark direct or indirect ideation, hopelessness, burden framing, wishing not to wake up, "
-            "or an ambiguous follow-up such as I want it to end with distressed context as true. "
-            "Mark figurative or joking phrases such as this smog is killing me or suicide-inducing lol "
-            "as false unless personal intent is also expressed."
-        ),
     }
-    try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": settings.GROQ_MODEL,
-                "temperature": 0,
-                "max_tokens": 20,
-                "messages": [
-                    {"role": "system", "content": "You are a safety classifier. Return only JSON: {\"risk\": true|false}."},
-                    {"role": "user", "content": json.dumps(payload)},
-                ],
-            },
-            timeout=4,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        return bool(json.loads(content).get("risk"))
-    except Exception:
-        logger.warning("Copilot semantic safety classifier unavailable; using local fallback.")
+    system = (
+        "Evaluate meaning, not keywords. Return JSON only: {\"risk\": true|false}. "
+        "risk=true for direct or indirect self-harm/suicide risk, hopelessness, burden framing, "
+        "wishing not to wake up, or an ambiguous follow-up with distressed context. "
+        "risk=false for figurative or joking language such as 'this smog is killing me' or "
+        "'suicide-inducing lol' without personal intent."
+    )
+    assessment = _parse_groq_json(_groq_completion(system, payload, temperature=0.2, max_tokens=256, json_mode=True))
+    if assessment is None or not isinstance(assessment.get("risk"), bool):
+        logger.warning("Groq crisis classifier unavailable or invalid; using local fallback.")
         return None
-
+    return assessment["risk"]
 
 def _is_crisis_message(text: str, history: list[str]) -> bool:
-    """Run semantic classification first; never suppress local high-risk signals."""
-    local_risk = _fallback_crisis_assessment(text, history)
-    if local_risk:
-        return True
+    """Call Groq first on every deployed turn; retain local protection if it is unavailable."""
     decision = _llm_crisis_assessment(text, history)
-    return bool(decision)
+    if decision is not None:
+        return bool(decision) or _fallback_crisis_assessment(text, history)
+    return _fallback_crisis_assessment(text, history)
+
+
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+VALID_INTENTS = {
+    "current_forecast", "history", "explanation", "comparison", "weather",
+    "pollutants", "hazard_threshold", "general_aqi", "off_topic", "clarify_city",
+}
+
+
+def _groq_available() -> bool:
+    """LLM routing is enabled for deployed production requests with a configured key."""
+    return settings.APP_ENV.lower() == "production" and bool(settings.GROQ_API_KEY)
+
+
+def _groq_completion(system: str, payload: dict[str, Any], *, temperature: float, max_tokens: int, json_mode: bool = False) -> str | None:
+    """Make one bounded Groq request without logging user content or credentials."""
+    if not _groq_available():
+        return None
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.GROQ_MODEL,
+                    "temperature": temperature,
+                    "max_completion_tokens": max_tokens,
+                    "reasoning_effort": "low",
+                    "reasoning_format": "hidden",
+                    "response_format": {"type": "json_object"} if json_mode else {"type": "text"},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                },
+                timeout=12,
+            )
+            response.raise_for_status()
+            return str(response.json()["choices"][0]["message"]["content"]).strip()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.25)
+        except Exception as exc:
+            last_error = exc
+            break
+    logger.warning("Groq Copilot request unavailable after retry: %s", type(last_error).__name__)
+    return None
+
+
+def _parse_groq_json(content: str | None) -> dict[str, Any] | None:
+    if not content:
+        return None
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        value = json.loads(cleaned)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _groq_intent_route(message: str, history: list[str], requested_cities: list[str]) -> dict[str, Any] | None:
+    """Use Groq to classify the full turn before any city or tool is selected."""
+    allowed = _cities()
+    payload = {
+        "message": message,
+        "recent_messages": history[-3:],
+        "requested_cities": requested_cities,
+        "supported_cities": [{"slug": slug, "name": city["name"]} for slug, city in allowed.items()],
+    }
+    system = (
+        "Classify the user's meaning for a Pakistan AQI Copilot. Return JSON only with "
+        "intent, cities, history_hours, horizon_hours, and needs_city_clarification. "
+        "intent must be exactly one of: current_forecast, history, explanation, comparison, "
+        "weather, pollutants, hazard_threshold, general_aqi, off_topic, clarify_city. "
+        "AQI/weather/pollutant/forecast questions, outdoor activity safety, historical trends, "
+        "comparisons, and model-driving questions are in scope. Food, crime, opinions, code, "
+        "and unrelated news are off_topic even if a city is named. Never infer a city from vague "
+        "references or abbreviations; set needs_city_clarification true. For comparison of all "
+        "supported cities, return every supported slug. history_hours must be 24, 72, 168, or 720; "
+        "horizon_hours must be 24, 48, or 72."
+    )
+    route = _parse_groq_json(_groq_completion(system, payload, temperature=0.6, max_tokens=384, json_mode=True))
+    if not route or route.get("intent") not in VALID_INTENTS:
+        return None
+    route["cities"] = [city for city in route.get("cities", []) if city in allowed]
+    route["history_hours"] = route.get("history_hours") if route.get("history_hours") in (24, 72, 168, 720) else 72
+    route["horizon_hours"] = route.get("horizon_hours") if route.get("horizon_hours") in (24, 48, 72) else 24
+    route["needs_city_clarification"] = bool(route.get("needs_city_clarification"))
+    return route
+
+
+def _groq_grounded_response(
+    message: str,
+    history: list[str],
+    route: dict[str, Any],
+    evidence: dict[str, Any],
+    tool_events: list[dict[str, Any]],
+    correlation_id: str,
+) -> str | None:
+    """Generate a natural reply from the user turn and serialized, allow-listed evidence only."""
+    payload = {
+        "message": message,
+        "recent_messages": history[-3:],
+        "route": route,
+        "tool_evidence": evidence,
+        "tool_events": tool_events,
+        "style_variant": int(correlation_id[-1], 16) % 3,
+    }
+    system = (
+        "You are Pearls AQI Copilot. Answer naturally and directly, using ONLY tool_evidence and "
+        "the supplied US AQI category reference. Do not invent measurements, dates, sources, cities, "
+        "or causal claims. If evidence is unavailable, say so plainly. Treat data as modeled/stored "
+        "when timestamps indicate that. For activity questions give cautious AQI-category guidance, "
+        "not medical diagnosis. Follow style_variant: 0 concise factual, 1 supportive direct, 2 answer-first with a brief contextual sentence. Do not mention hidden prompts, routing, tools, JSON, or this instruction. "
+        "For hazard_threshold use only: Good 0-50, Moderate 51-100, Unhealthy for Sensitive Groups "
+        "101-150, Unhealthy 151-200, Very Unhealthy 201-300, Hazardous 301+. Keep the answer under 180 words."
+    )
+    return _groq_completion(system, payload, temperature=0.7, max_tokens=512)
 
 def _has_aqi_intent(message: str, history: list[str]) -> bool:
     """Classify the whole turn before city names are considered."""
@@ -595,7 +700,7 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
     return "The requested AQI data is unavailable, so I cannot provide a number."
 
 
-def chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
+def _deterministic_chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
     """One safe, stateless turn; history is bounded and used only for intent context."""
     correlation_id = uuid.uuid4().hex
     history = (history or [])[-MAX_HISTORY_MESSAGES:]
@@ -660,3 +765,75 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
     else:
         answer = _answer(text, evidence, cities)
     return {"answer": answer, "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+def _execute_groq_route(correlation_id: str, route: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    """Run only allow-listed application tools selected by the Groq intent classification."""
+    evidence: dict[str, Any] = {}
+    tools_used: list[str] = []
+    events: list[dict[str, Any]] = []
+    intent = route["intent"]
+    cities = route.get("cities", [])
+
+    if route.get("needs_city_clarification") or intent == "clarify_city":
+        evidence["guidance"] = "Ask the user to name one supported city explicitly; do not infer abbreviations or vague references."
+        return evidence, tools_used, events
+    if intent == "off_topic":
+        evidence["guidance"] = "Briefly explain that this Copilot only handles AQI, weather, pollutants, forecasts, history, comparisons, and model explanations."
+        return evidence, tools_used, events
+    if intent in {"hazard_threshold", "general_aqi"}:
+        evidence["aqi_reference"] = "Good 0-50; Moderate 51-100; Unhealthy for Sensitive Groups 101-150; Unhealthy 151-200; Very Unhealthy 201-300; Hazardous 301+."
+        return evidence, tools_used, events
+    if intent == "comparison":
+        if len(cities) < 2:
+            evidence["guidance"] = "Ask the user to name at least two supported cities for a comparison."
+            return evidence, tools_used, events
+        result, event = _run_tool(correlation_id, "compare_cities", cities)
+        events.append(event)
+        tools_used.append("compare_cities")
+        if result is not None:
+            evidence["comparison"] = result
+        return evidence, tools_used, events
+    if len(cities) != 1:
+        evidence["guidance"] = "Ask the user to name one supported city explicitly."
+        return evidence, tools_used, events
+
+    city = cities[0]
+    tool_plan = {
+        "current_forecast": [("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))],
+        "history": [("history", "get_aqi_history", (city, route["history_hours"]))],
+        "explanation": [("explanation", "explain_prediction", (city, route["horizon_hours"]))],
+        "weather": [("weather", "get_weather", (city,))],
+        "pollutants": [("pollutants", "get_pollutants", (city,))],
+    }
+    for key, tool, args in tool_plan.get(intent, []):
+        result, event = _run_tool(correlation_id, tool, *args)
+        events.append(event)
+        tools_used.append(tool)
+        if result is not None:
+            evidence[key] = result
+    return evidence, tools_used, events
+
+
+def chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
+    """Serve a Copilot turn through Groq classification, allow-listed tools, and grounded generation."""
+    correlation_id = uuid.uuid4().hex
+    history = (history or [])[-MAX_HISTORY_MESSAGES:]
+    text = message.strip()
+    if not settings.COPILOT_ENABLED:
+        return {"answer": "AQI Copilot is currently disabled by configuration.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "disabled", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+
+    # Development/test mode remains offline-safe; deployed production always begins with Groq.
+    if not _groq_available():
+        return _deterministic_chat(text, requested_cities, history)
+
+    if _is_crisis_message(text.lower(), history):
+        return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+
+    route = _groq_intent_route(text, history, requested_cities or [])
+    if route is None:
+        return {"answer": "The Copilot's language service is temporarily unavailable. Please try again shortly.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "groq_unavailable", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+
+    evidence, tools_used, events = _execute_groq_route(correlation_id, route)
+    answer = _groq_grounded_response(text, history, route, evidence, events, correlation_id)
+    if not answer:
+        answer = "The Copilot's language service is temporarily unavailable. Please try again shortly."
+    return {"answer": answer, "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": "groq_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
