@@ -16,7 +16,7 @@ from pearls_aqi.data.weather_provider import OpenMeteoWeatherProvider
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.features.builder import build_features
 from pearls_aqi.features.store import load_training_data
-from pearls_aqi.models.explain import explain_prediction, shap_local_explanation
+from pearls_aqi.models.explain import explain_prediction, global_feature_importance, shap_local_explanation
 from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
@@ -232,29 +232,45 @@ def get_pollutants(city: str) -> dict[str, Any]:
 
 
 def get_aqi_history(city: str, hours: int = 72) -> dict[str, Any]:
-    frame = _city_data(city).tail(max(1, min(hours, 168)))
+    frame = _city_data(city).tail(max(1, min(hours, 720)))
     points = [{"time": row.event_time_utc.isoformat(), "aqi": round(float(row.aqi), 1)} for row in frame[["event_time_utc", "aqi"]].itertuples(index=False)]
     return {"city": city, "hours": len(points), "is_stale": _stale(points[-1]["time"]), "points": points}
 
 
 def explain_city_prediction(city: str, horizon_hours: int = 24) -> dict[str, Any]:
+    """Return a real local SHAP explanation, or real permutation importance fallback."""
     if horizon_hours not in (24, 48, 72):
         raise ValueError("Explanation horizon must be 24, 48, or 72 hours.")
     model, _ = _city_champion(city)
-    row = _city_data(city).iloc[[-1]]
+    data = _city_data(city)
+    row = data.iloc[[-1]]
     issued_at = pd.Timestamp(row.iloc[0]["event_time_utc"])
     row = _add_forecast_weather_features(row, city, issued_at)
+    prediction = float(explain_prediction(model, row, horizon_hours)["prediction"])
     try:
         explanation = shap_local_explanation(model, row, horizon_hours)
-        factors = [{"feature": item["feature"], "contribution": round(float(item["shap_value"]), 3)} for item in explanation["contributions"][:5]]
-        method = "shap"
+        factors = [
+            {"feature": item["feature"], "contribution": round(float(item["shap_value"]), 3)}
+            for item in explanation["contributions"][:5]
+        ]
+        method = "shap_local"
     except Exception:
-        explanation = explain_prediction(model, row, horizon_hours)
-        factors = []
-        method = "feature_values_fallback"
+        importance = global_feature_importance(model, data, horizon_hours)
+        factors = [
+            {"feature": item["feature"], "contribution": round(float(item["importance"]), 3)}
+            for item in importance[:5]
+        ]
+        method = "permutation_importance"
     timestamp = row.iloc[0]["event_time_utc"].isoformat()
-    return {"city": city, "horizon_hours": horizon_hours, "issued_at_utc": timestamp, "is_stale": _stale(timestamp), "prediction": round(float(explanation["prediction"]), 1), "method": method, "top_factors": factors}
-
+    return {
+        "city": city,
+        "horizon_hours": horizon_hours,
+        "issued_at_utc": timestamp,
+        "is_stale": _stale(timestamp),
+        "prediction": round(prediction, 1),
+        "method": method,
+        "top_factors": factors,
+    }
 
 def compare_cities(cities: list[str]) -> dict[str, Any]:
     if not cities:
@@ -326,19 +342,36 @@ def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
     """Conservative no-network fallback when semantic classification is unavailable."""
     if _obvious_hyperbole(text):
         return False
+
     patterns = (
-        r"\b(kill|hurt|harm) myself\b", r"\bend my life\b", r"\bwant to die\b",
-        r"\bdon'?t want to (live|be alive)\b", r"\blife (is not|isn'?t) worth living\b",
-        r"\b(easiest|best) way to (just )?end it\b", r"\bnot waking up tomorrow\b",
-        r"\beveryone would be better off without me\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
+        r"\b(kill|hurt|harm) myself\b",
+        r"\bend my life\b",
+        r"\bwant to die\b",
+        r"\bdon'?t want to (live|be alive)\b",
+        r"\blife (is not|isn'?t) worth living\b",
+        r"\b(easiest|best) way to (just )?end it\b",
+        r"\bnot waking up tomorrow\b",
+        r"\beveryone would be better off without me\b",
+        r"\bgiving up on everything\b",
+        r"\banyone would even notice if i wasn'?t here\b",
+        r"\bif i (was not|wasn'?t) here\b",
+        r"\bjust want it to end\b",
+        r"\bsuicid(?:e|al)\b",
+        r"\bself[- ]?harm\b",
     )
     if any(re.search(pattern, text) for pattern in patterns):
         return True
+
     if re.search(r"\b(just )?want (it|this) to end\b", text):
         context = " ".join(history).lower()
-        return any(term in context for term in ("alone", "hopeless", "better off without", "not alive", "hurt myself", "suicide"))
+        return any(
+            term in context
+            for term in (
+                "alone", "hopeless", "better off without", "not alive",
+                "hurt myself", "suicide", "giving up",
+            )
+        )
     return False
-
 
 def _llm_crisis_assessment(message: str, history: list[str]) -> bool | None:
     """Use Groq for a small semantic risk classification before tool routing."""
@@ -379,9 +412,12 @@ def _llm_crisis_assessment(message: str, history: list[str]) -> bool | None:
 
 
 def _is_crisis_message(text: str, history: list[str]) -> bool:
-    """Run semantic production safety classification before every other route."""
+    """Run semantic classification first; never suppress local high-risk signals."""
+    local_risk = _fallback_crisis_assessment(text, history)
+    if local_risk:
+        return True
     decision = _llm_crisis_assessment(text, history)
-    return _fallback_crisis_assessment(text, history) if decision is None else decision
+    return bool(decision)
 
 def _has_aqi_intent(message: str, history: list[str]) -> bool:
     """Classify the whole turn before city names are considered."""
@@ -391,23 +427,47 @@ def _has_aqi_intent(message: str, history: list[str]) -> bool:
         "ozone", "nitrogen dioxide", "carbon monoxide", "sulphur dioxide", "sulfur dioxide",
         "weather", "temperature", "humidity", "wind", "rain", "precipitation", "pressure",
         "forecast", "dust", "heat", "air looking", "how's the air", "hows the air", "air today",
+        "history", "historical", "last week", "past month", "last few days", "aqi trend",
+        "best air", "cleanest air", "worst air", "hazardous aqi", "aqi level",
     )
     if any(term in text for term in direct_terms) or re.search(r"\bair\b", text):
         return True
-    activity_question = any(term in text for term in ("jog", "run", "walk", "exercise", "workout", "outdoor", "outdoors", "outside", "picnic", "play outside", "kids", "children", "elderly", "commute", "commuting", "school"))
-    asks_permission = any(term in text for term in ("can i", "can children", "can my", "should i", "should we", "should they", "should my", "is it safe", "is it okay", "safe to", "today", "tomorrow", "this weekend"))
+    supported_mentions = sum(1 for slug, city in _cities().items() if slug in text or city["name"].lower() in text)
+    if "compare" in text and supported_mentions >= 2:
+        return True
+    if any(term in text for term in ("all six cities", "all cities", "every city")) and any(
+        term in text for term in ("best", "worst", "cleanest", "healthiest", "safest")
+    ):
+        return True
+    activity_question = any(term in text for term in (
+        "jog", "run", "walk", "exercise", "workout", "outdoor", "outdoors", "outside",
+        "picnic", "play", "kids", "children", "elderly", "older adult", "commute",
+        "commuting", "school", "bike", "football",
+    ))
+    asks_permission = any(term in text for term in (
+        "can i", "can children", "can my", "should i", "should we", "should they", "should my",
+        "is it safe", "is it okay", "safe to", "today", "tomorrow", "this weekend",
+    ))
     if activity_question and asks_permission:
         return True
     return bool(re.search(r"\bwhat about\b", text) and history and _has_aqi_intent(history[-1], []))
 
+
+def _ambiguous_city_clarification(text: str) -> str | None:
+    """Never guess a city from abbreviations or vague references."""
+    tokens = set(re.findall(r"\b[a-z]+\b", text))
+    if tokens.intersection({"isb", "khi", "lhr"}) or "the capital" in text or "my city" in text:
+        return "Please name a supported city explicitly; I cannot safely infer abbreviations, 'the capital', or 'my city'."
+    return None
 def _resolve_cities(message: str, requested: list[str], history: list[str]) -> tuple[list[str], str | None]:
     text = message.lower()
     allowed = _cities()
-    if any(alias in re.findall(r"\b[a-z]+\b", text) for alias in ("isb", "khi")) or "the capital" in text or "my city" in text:
-        return [], "Please name a supported city explicitly; I cannot safely infer abbreviations, 'the capital', or 'my city'."
+    clarification = _ambiguous_city_clarification(text)
+    if clarification:
+        return [], clarification
     candidates = requested or [slug for slug, city in allowed.items() if slug in text or city["name"].lower() in text]
     resolved = [city.lower().strip() for city in candidates if city.lower().strip() in allowed]
-    all_city_terms = ("all cities", "every city", "which city", "best city", "preferable", "safest", "cleanest", "healthiest", "where should", "compare")
+    all_city_terms = ("all cities", "all six cities", "every city", "which city", "best city", "preferable", "safest", "cleanest", "healthiest", "where should", "compare")
     if not resolved and any(term in text for term in all_city_terms):
         resolved = list(allowed)
     if not resolved and re.search(r"\b(mult(an|on)|faisalabad|rawalpindi|hyderabad|gujranwala)\b", text):
@@ -417,6 +477,14 @@ def _resolve_cities(message: str, requested: list[str], history: list[str]) -> t
     return resolved, None
 
 
+def _history_hours(text: str) -> int:
+    if any(term in text for term in ("month", "30 day")):
+        return 720
+    if any(term in text for term in ("week", "7 day")):
+        return 168
+    if any(term in text for term in ("few days", "3 day", "past 3")):
+        return 72
+    return 72
 def _stale_notice(evidence: dict[str, Any]) -> str:
     def contains_stale(value: Any) -> bool:
         if isinstance(value, dict):
@@ -451,6 +519,10 @@ def _activity_advice(category: str) -> str:
 def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
     text = message.lower()
     if not evidence:
+        if "ignore current" in text or "what you think" in text:
+            return "I can report grounded AQI forecasts, not a personal guess. Please name one supported city so I can check its stored data and forecast."
+        if "aqi" in text and any(term in text for term in ("dangerous", "hurt", "hazard", "threshold")):
+            return "US AQI categories describe health risk: 151-200 is Unhealthy, 201-300 is Very Unhealthy, and 301+ is Hazardous. At those levels people should reduce outdoor exposure and follow local public-health guidance; AQI is not a measure of harm to a specific person."
         if "aqi" in text and any(term in text for term in ("stand", "mean", "what is", "category")):
             return "AQI means Air Quality Index. Lower values indicate cleaner air: Good 0-50, Moderate 51-100, Unhealthy for Sensitive Groups 101-150, Unhealthy 151-200, Very Unhealthy 201-300, and Hazardous 301+."
         if any(term in text for term in ("health", "mask", "exercise", "precaution")):
@@ -477,17 +549,25 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
         return f"{city.title()} changed {change:+.1f} AQI over the last {evidence['history']['hours']} stored hours.\n\nIt moved from {points[0]['aqi']:.1f} to {points[-1]['aqi']:.1f}. Historical data ends at {points[-1]['time']}." + _stale_notice(evidence["history"])
     if "weather" in evidence:
         weather = evidence["weather"]
-        return f"{city.title()} is {weather['temperature_c']}Â°C with {weather['humidity_pct']}% humidity.\n\nWind is {weather['wind_kph']} km/h and precipitation is {weather['precipitation_mm']} mm. Stored observation: {weather['observed_at_utc']}." + _stale_notice(weather)
+        return (
+            f"{city.title()} is {weather['temperature_c']}\u00b0C with {weather['humidity_pct']}% humidity.\n\n"
+            f"Wind is {weather['wind_kph']} km/h and precipitation is {weather['precipitation_mm']} mm. "
+            f"Stored observation: {weather['observed_at_utc']}."
+        ) + _stale_notice(weather)
     if "pollutants" in evidence:
         p = evidence["pollutants"]
-        return f"For {city.title()}, PM2.5 is {p['pm2_5']} Âµg/mÂ³ and PM10 is {p['pm10']} Âµg/mÂ³.\n\nNOâ‚‚ is {p['no2']} Âµg/mÂ³ and ozone is {p['ozone']} Âµg/mÂ³. Stored observation: {p['observed_at_utc']}." + _stale_notice(p)
+        return (
+            f"For {city.title()}, PM2.5 is {p['pm2_5']} \u00b5g/m\u00b3 and PM10 is {p['pm10']} \u00b5g/m\u00b3.\n\n"
+            f"NO\u2082 is {p['no2']} \u00b5g/m\u00b3 and ozone is {p['ozone']} \u00b5g/m\u00b3. "
+            f"Stored observation: {p['observed_at_utc']}."
+        ) + _stale_notice(p)
     if "explanation" in evidence:
         e = evidence["explanation"]
         factors = ", ".join(item["feature"] for item in e["top_factors"][:3]) or "the selected model features"
         return f"The {e['horizon_hours']}-hour forecast for {city.title()} is {e['prediction']:.1f} AQI.\n\nThe {e['method']} explanation highlights {factors}. These factors explain the model output, not a proven pollution source." + _stale_notice(e)
     if current and forecast:
         forecast_values = {item["horizon_hours"]: item["aqi"] for item in forecast["forecasts"]}
-        asks_activity = any(term in text for term in ("jog", "run", "exercise", "workout", "outdoor activity"))
+        asks_activity = any(term in text for term in ("jog", "run", "walk", "exercise", "workout", "outdoor activity", "outside", "outdoors", "play", "kids", "children", "elderly", "older adult", "commute", "bike", "football"))
         asks_aqi_definition = "aqi" in text and any(term in text for term in ("what's the deal", "what is the deal", "mean", "stand for", "anyway"))
         values = _forecast_summary(forecast["forecasts"])
         if asks_activity or asks_aqi_definition:
@@ -505,7 +585,7 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
         if any(term in text for term in ("why", "worse", "better", "trend")):
             change = forecast_values[72] - current["aqi"]
             direction = "worsening" if change > 5 else "improving" if change < -5 else "broadly stable"
-            return f"{city.title()} is forecast to be {direction} over the next three days.\n\nCurrent AQI is {current['aqi']:.1f} ({current['category']}); the 72-hour forecast is {forecast_values[72]:.1f} ({change:+.1f}). This forecast does not prove a specific emissions source.\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
+            return f"{city.title()} is forecast to be {direction} over the next three days.\n\nCurrent AQI is {current['aqi']:.1f} ({current['category']}); the 72-hour forecast is {forecast_values[72]:.1f} ({change:+.1f}). Stored observation: {current['observed_at_utc']}." + _stale_notice(current)
         if "tomorrow" in text or "24 hour" in text or "24h" in text:
             first = forecast_values[24]
             return f"For tomorrow, {city.title()} is forecast at {first:.1f} AQI ({forecast['forecasts'][0]['category']}).\n\nIt is {current['aqi']:.1f} AQI now ({current['category']}).\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
@@ -527,6 +607,9 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     if _injection_or_internal_request(lower):
         return {"answer": "I can help with supported AQI information, but I cannot reveal internal instructions or bypass grounding and safety rules.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+    ambiguous_city = _ambiguous_city_clarification(lower)
+    if ambiguous_city:
+        return {"answer": ambiguous_city, "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     if _off_topic(lower) or not _has_aqi_intent(text, history):
         return {"answer": "I am limited to supported AQI, weather, pollutant, forecast, history, and model-explanation questions for this project.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     cities, clarification = _resolve_cities(text, requested_cities or [], history)
@@ -549,18 +632,20 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         plan: list[tuple[str, str, tuple]] = []
         weather_terms = ("weather", "temperature", "humidity", "wind", "rain", "pressure")
         pollutant_terms = ("pm2", "pm10", "pollutant", "ozone", "no2", "so2", "carbon monoxide")
-        history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical")
-        explanation_terms = ("explain", "shap", "feature importance", "predicted high")
-        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "walk", "exercise", "workout", "outside", "outdoors", "play", "kids", "children", "elderly", "commute", "commuting", "school", "picnic", "dust", "heat", "pollution", "smog")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
+        history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical", "last week", "past week", "past month", "last month", "last few days", "trend over")
+        explanation_terms = ("explain", "shap", "feature importance", "predicted high", "what's driving", "whats driving", "driving", "why is", "why was")
+        wants_history = any(term in lower for term in history_terms)
+        wants_explanation = any(term in lower for term in explanation_terms) or ("predicted" in lower and "high" in lower)
+        needs_status = not wants_history and not wants_explanation and (any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "walk", "exercise", "workout", "outside", "outdoors", "play", "kids", "children", "elderly", "commute", "commuting", "school", "picnic", "dust", "heat", "pollution", "smog")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], [])))
         if needs_status:
             plan.extend([("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))])
         if any(term in lower for term in weather_terms):
             plan.append(("weather", "get_weather", (city,)))
         if any(term in lower for term in pollutant_terms):
             plan.append(("pollutants", "get_pollutants", (city,)))
-        if any(term in lower for term in history_terms):
-            plan.append(("history", "get_aqi_history", (city, 72)))
-        if any(term in lower for term in explanation_terms) or ("predicted" in lower and "high" in lower):
+        if wants_history:
+            plan.append(("history", "get_aqi_history", (city, _history_hours(lower))))
+        if wants_explanation:
             horizon = 72 if "72" in lower else 48 if "48" in lower else 24
             plan.append(("explanation", "explain_prediction", (city, horizon)))
 
