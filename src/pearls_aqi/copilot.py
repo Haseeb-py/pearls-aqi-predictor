@@ -1,5 +1,6 @@
 """Safe, deterministic AQI Copilot with an explicit application-tool allow-list."""
 
+import json
 import logging
 import re
 import time
@@ -313,15 +314,74 @@ def _crisis_response() -> str:
     )
 
 
-def _is_crisis_message(text: str) -> bool:
-    """Detect direct self-harm or suicide statements before every other route."""
+def _obvious_hyperbole(text: str) -> bool:
+    """Avoid treating figurative pollution complaints as self-harm disclosures."""
+    return any(phrase in text for phrase in (
+        "suicide-inducing", "killing me", "could just die from this smog",
+        "could die from this smog", "dying from this smog", "i am dead from",
+    ))
+
+
+def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
+    """Conservative no-network fallback when semantic classification is unavailable."""
+    if _obvious_hyperbole(text):
+        return False
     patterns = (
         r"\b(kill|hurt|harm) myself\b", r"\bend my life\b", r"\bwant to die\b",
         r"\bdon'?t want to (live|be alive)\b", r"\blife (is not|isn'?t) worth living\b",
-        r"\b(easiest|best) way to (just )?end it\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
+        r"\b(easiest|best) way to (just )?end it\b", r"\bnot waking up tomorrow\b",
+        r"\beveryone would be better off without me\b", r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
     )
-    return any(re.search(pattern, text) for pattern in patterns)
+    if any(re.search(pattern, text) for pattern in patterns):
+        return True
+    if re.search(r"\b(just )?want (it|this) to end\b", text):
+        context = " ".join(history).lower()
+        return any(term in context for term in ("alone", "hopeless", "better off without", "not alive", "hurt myself", "suicide"))
+    return False
 
+
+def _llm_crisis_assessment(message: str, history: list[str]) -> bool | None:
+    """Use Groq for a small semantic risk classification before tool routing."""
+    if settings.APP_ENV.lower() != "production" or not settings.GROQ_API_KEY:
+        return None
+    payload = {
+        "current_message": message,
+        "recent_messages": history[-3:],
+        "task": (
+            "Classify genuine self-harm or suicide risk. Return JSON only with a risk boolean. "
+            "Mark direct or indirect ideation, hopelessness, burden framing, wishing not to wake up, "
+            "or an ambiguous follow-up such as I want it to end with distressed context as true. "
+            "Mark figurative or joking phrases such as this smog is killing me or suicide-inducing lol "
+            "as false unless personal intent is also expressed."
+        ),
+    }
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": settings.GROQ_MODEL,
+                "temperature": 0,
+                "max_tokens": 20,
+                "messages": [
+                    {"role": "system", "content": "You are a safety classifier. Return only JSON: {\"risk\": true|false}."},
+                    {"role": "user", "content": json.dumps(payload)},
+                ],
+            },
+            timeout=4,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return bool(json.loads(content).get("risk"))
+    except Exception:
+        logger.warning("Copilot semantic safety classifier unavailable; using local fallback.")
+        return None
+
+
+def _is_crisis_message(text: str, history: list[str]) -> bool:
+    """Run semantic production safety classification before every other route."""
+    decision = _llm_crisis_assessment(text, history)
+    return _fallback_crisis_assessment(text, history) if decision is None else decision
 
 def _has_aqi_intent(message: str, history: list[str]) -> bool:
     """Classify the whole turn before city names are considered."""
@@ -330,12 +390,12 @@ def _has_aqi_intent(message: str, history: list[str]) -> bool:
         "aqi", "air quality", "air pollution", "pollution", "pollutant", "smog", "pm2", "pm10",
         "ozone", "nitrogen dioxide", "carbon monoxide", "sulphur dioxide", "sulfur dioxide",
         "weather", "temperature", "humidity", "wind", "rain", "precipitation", "pressure",
-        "forecast", "air looking", "how's the air", "hows the air", "air today",
+        "forecast", "dust", "heat", "air looking", "how's the air", "hows the air", "air today",
     )
-    if any(term in text for term in direct_terms):
+    if any(term in text for term in direct_terms) or re.search(r"\bair\b", text):
         return True
-    activity_question = any(term in text for term in ("jog", "run", "walk", "exercise", "workout", "outdoors"))
-    asks_permission = any(term in text for term in ("can i", "should i", "is it safe", "safe to", "today", "tomorrow"))
+    activity_question = any(term in text for term in ("jog", "run", "walk", "exercise", "workout", "outdoor", "outdoors", "outside", "picnic", "play outside", "kids", "children", "elderly", "commute", "commuting", "school"))
+    asks_permission = any(term in text for term in ("can i", "can children", "can my", "should i", "should we", "should they", "should my", "is it safe", "is it okay", "safe to", "today", "tomorrow", "this weekend"))
     if activity_question and asks_permission:
         return True
     return bool(re.search(r"\bwhat about\b", text) and history and _has_aqi_intent(history[-1], []))
@@ -463,7 +523,7 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
     lower = text.lower()
     if not settings.COPILOT_ENABLED:
         return {"answer": "AQI Copilot is currently disabled by configuration.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
-    if _is_crisis_message(lower):
+    if _is_crisis_message(lower, history):
         return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     if _injection_or_internal_request(lower):
         return {"answer": "I can help with supported AQI information, but I cannot reveal internal instructions or bypass grounding and safety rules.", "tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
@@ -491,7 +551,7 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         pollutant_terms = ("pm2", "pm10", "pollutant", "ozone", "no2", "so2", "carbon monoxide")
         history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical")
         explanation_terms = ("explain", "shap", "feature importance", "predicted high")
-        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "exercise", "workout", "pollution", "smog")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
+        needs_status = any(term in lower for term in ("aqi", "air", "forecast", "looking", "worse", "better", "trend", "jog", "run", "walk", "exercise", "workout", "outside", "outdoors", "play", "kids", "children", "elderly", "commute", "commuting", "school", "picnic", "dust", "heat", "pollution", "smog")) or bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
         if needs_status:
             plan.extend([("current", "get_current_aqi", (city,)), ("forecast", "get_aqi_forecast", (city,))])
         if any(term in lower for term in weather_terms):
