@@ -416,7 +416,7 @@ if selected_page == "AQI Copilot":
                 reply = requests.post(
                     f"{settings.API_BASE_URL}/api/v1/copilot/chat",
                     json={"message": question, "history": history},
-                    timeout=35,
+                    timeout=60,
                 )
                 reply.raise_for_status()
 

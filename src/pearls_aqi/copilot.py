@@ -414,44 +414,35 @@ def _groq_available() -> bool:
 
 
 def _groq_completion(system: str, payload: dict[str, Any], *, temperature: float, max_tokens: int, json_mode: bool = False) -> str | None:
-    """Make one bounded Groq request without logging user content or credentials."""
+    """Make one bounded Groq request so a single turn stays within dashboard limits."""
     if not _groq_available():
         return None
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            response = requests.post(
-                GROQ_CHAT_COMPLETIONS_URL,
-                headers={
-                    "Authorization": f"Bearer {settings.GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": settings.GROQ_MODEL,
-                    "temperature": temperature,
-                    "max_completion_tokens": max_tokens,
-                    "reasoning_effort": "low",
-                    "reasoning_format": "hidden",
-                    "response_format": {"type": "json_object"} if json_mode else {"type": "text"},
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                },
-                timeout=12,
-            )
-            response.raise_for_status()
-            return str(response.json()["choices"][0]["message"]["content"]).strip()
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt == 0:
-                time.sleep(0.25)
-        except Exception as exc:
-            last_error = exc
-            break
-    logger.warning("Groq Copilot request unavailable after retry: %s", type(last_error).__name__)
-    return None
-
+    try:
+        response = requests.post(
+            GROQ_CHAT_COMPLETIONS_URL,
+            headers={
+                "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings.GROQ_MODEL,
+                "temperature": temperature,
+                "max_completion_tokens": max_tokens,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden",
+                "response_format": {"type": "json_object"} if json_mode else {"type": "text"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        return str(response.json()["choices"][0]["message"]["content"]).strip()
+    except Exception as exc:
+        logger.warning("Groq Copilot request unavailable: %s", type(exc).__name__)
+        return None
 
 def _parse_groq_json(content: str | None) -> dict[str, Any] | None:
     if not content:
