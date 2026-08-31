@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 STALE_AFTER_HOURS = 30
 MAX_HISTORY_MESSAGES = 6
 CACHE_TTL_SECONDS = 300
+MODEL_CACHE_TTL_SECONDS = 3600
 
 # Reusing one city frame/model within a short window avoids duplicate
 # Hopsworks reads when a single question needs both current data and a forecast.
@@ -99,7 +100,7 @@ def _city_data(city: str) -> pd.DataFrame:
 def _city_champion(city: str) -> tuple[Any, dict[str, Any]]:
     now = time.monotonic()
     cached = _CHAMPION_CACHE.get(city)
-    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+    if cached and now - cached[0] < MODEL_CACHE_TTL_SECONDS:
         return cached[1]
     champion = load_champion(city)
     _CHAMPION_CACHE[city] = (now, champion)

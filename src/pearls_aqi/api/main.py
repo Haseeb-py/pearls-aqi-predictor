@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from pearls_aqi.copilot import _city_data, chat, warm_city_cache
+from pearls_aqi.copilot import _city_champion, _city_data, chat, warm_city_cache
 from pearls_aqi.domain.aqi_categories import get_us_aqi_category
 from pearls_aqi.domain.schemas import (
     CityConfig,
@@ -17,7 +17,6 @@ from pearls_aqi.domain.schemas import (
     ForecastHorizonOutput,
     ForecastResponse,
 )
-from pearls_aqi.models.registry import load_champion
 from pearls_aqi.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -49,9 +48,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def warm_default_city_cache() -> None:
-    """Warm Lahore feature cache without making startup depend on it."""
+    """Warm the dashboard's default city without making startup depend on it."""
     try:
-        warm_city_cache("lahore")
+        warm_city_cache("karachi")
     except Exception:
         logger.exception("Default city cache warmup failed; continuing startup.")
 
@@ -194,7 +193,8 @@ def predict(city: str) -> ForecastResponse:
     city_cfg = _city_config(city)
 
     try:
-        model, metadata = load_champion(city)
+        # This cache prevents a Hopsworks registry round trip on every API request.
+        model, metadata = _city_champion(city)
     except FileNotFoundError as exc:
         logger.exception("No trained model available for city=%s", city)
         raise HTTPException(
