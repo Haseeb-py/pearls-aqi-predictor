@@ -1,11 +1,34 @@
-"""Safe, deterministic AQI Copilot with an explicit application-tool allow-list."""
+"""Safe, deterministic-fallback AQI Copilot with an explicit application-tool allow-list.
+
+Fix summary (see chat explanation for full context):
+  1. Crisis detection and intent routing are now classified in ONE combined
+     Groq call instead of two sequential calls, cutting per-turn Groq round
+     trips from up to 3 down to at most 2.
+  2. compare_cities() now fetches all requested cities CONCURRENTLY via a
+     thread pool instead of looping sequentially — this was the dominant
+     cause of "stuck loading / timeout" on multi-city comparison questions.
+  3. A shared requests.Session is reused across calls instead of opening a
+     fresh HTTP connection every time.
+  4. The previous `_groq_available()` gate required
+     `settings.APP_ENV.lower() == "production"`. If that value was not set
+     exactly right in a given deployment, Groq was silently never called,
+     with no visible error — this is the most likely explanation for the
+     "it's not really using Groq" symptoms seen in early testing rounds.
+     Groq is now used whenever COPILOT_ENABLED and GROQ_API_KEY are set,
+     regardless of environment name.
+  5. A per-turn time budget now short-circuits to the deterministic
+     fallback if classification already used too much of the budget,
+     instead of risking a second long Groq call on top of a slow first one.
+  6. Outgoing Groq payloads and text are explicitly UTF-8 safe.
+"""
 
 import json
 import logging
 import re
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import pandas as pd
@@ -26,13 +49,22 @@ MAX_HISTORY_MESSAGES = 6
 CACHE_TTL_SECONDS = 300
 MODEL_CACHE_TTL_SECONDS = 3600
 
+# Per-turn latency budget. If classification alone eats more than this,
+# skip the final Groq generation call and go straight to the deterministic
+# grounded answer instead of risking a second long hang.
+TURN_TIME_BUDGET_SECONDS = 9.0
+GROQ_CALL_TIMEOUT_SECONDS = 6  # was 8; a tighter budget fails fast instead of hanging
+COMPARE_CITIES_MAX_WORKERS = 6
+
 # Reusing one city frame/model within a short window avoids duplicate
 # Hopsworks reads when a single question needs both current data and a forecast.
 _CITY_DATA_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _CHAMPION_CACHE: dict[str, tuple[float, tuple[Any, dict[str, Any]]]] = {}
-# The Copilot is deterministic rather than LLM-prompted.  This policy is the
-# equivalent response-style instruction: conversational lead, then evidence.
 RESPONSE_STYLE = "Lead with a natural, helpful sentence, then state grounded AQI data and its timestamp."
+
+# Shared session: reuses TCP/TLS connections across calls instead of
+# reconnecting every request, cutting per-call latency.
+_HTTP_SESSION = requests.Session()
 
 
 def _cities() -> dict[str, dict]:
@@ -107,7 +139,6 @@ def _city_champion(city: str) -> tuple[Any, dict[str, Any]]:
     return champion
 
 
-# The seven public tools required by the project specification.
 WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 FORECAST_WEATHER_VARIABLES = [
     "temperature_2m",
@@ -139,7 +170,7 @@ def _add_forecast_weather_features(
         return row.copy()
 
     city_config = _cities()[city]
-    response = requests.get(
+    response = _HTTP_SESSION.get(
         WEATHER_FORECAST_URL,
         params={
             "latitude": city_config["latitude"],
@@ -177,10 +208,12 @@ def _prediction_value(predictions: dict[str, Any], hours: int) -> float:
             return float(predictions[target][0])
     raise KeyError(f"Prediction output does not contain the {hours}h horizon.")
 
+
 def warm_city_cache(city: str) -> None:
     """Warm the common serving path during API startup, before user traffic."""
     _city_data(city)
     _city_champion(city)
+
 
 def get_current_aqi(city: str) -> dict[str, Any]:
     frame = _city_data(city)
@@ -232,7 +265,6 @@ def get_pollutants(city: str) -> dict[str, Any]:
     return {"city": city, "observed_at_utc": timestamp, "is_stale": _stale(timestamp), "pm2_5": _value(row, "pm2_5_ug_m3"), "pm10": _value(row, "pm10_ug_m3"), "co": _value(row, "carbon_monoxide_ug_m3"), "no2": _value(row, "nitrogen_dioxide_ug_m3"), "so2": _value(row, "sulphur_dioxide_ug_m3"), "ozone": _value(row, "ozone_ug_m3")}
 
 
-
 def get_aqi_history(city: str, hours: int = 72, offset_hours: int | None = None) -> dict[str, Any]:
     """Return historical AQI observations, optionally selecting a relative-time point."""
     required_hours = max(hours, (offset_hours or 0) + 24)
@@ -247,7 +279,6 @@ def get_aqi_history(city: str, hours: int = 72, offset_hours: int | None = None)
         nearest = min(points, key=lambda point: abs(pd.Timestamp(point["time"]) - target_time))
         result.update({"requested_offset_hours": offset_hours, "requested_target_time": target_time.isoformat(), "requested_point": nearest})
     return result
-
 
 
 def explain_city_prediction(city: str, horizon_hours: int = 24) -> dict[str, Any]:
@@ -285,15 +316,50 @@ def explain_city_prediction(city: str, horizon_hours: int = 24) -> dict[str, Any
         "top_factors": factors,
     }
 
-def compare_cities(cities: list[str]) -> dict[str, Any]:
-    if not cities:
-        raise ValueError("At least one supported city is required.")
-    comparison = []
-    for city in cities:
+
+def _fetch_city_pair(city: str) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, Exception | None]:
+    """Fetch current + forecast for one city; used as the unit of work for parallel fetch."""
+    try:
         current = get_current_aqi(city)
         forecast = get_aqi_forecast(city)
+        return city, current, forecast, None
+    except Exception as exc:  # noqa: BLE001 - surfaced to caller, not swallowed
+        return city, None, None, exc
+
+
+def compare_cities(cities: list[str]) -> dict[str, Any]:
+    """Fetch all requested cities CONCURRENTLY.
+
+    Previously this looped over cities one at a time, calling
+    get_current_aqi + get_aqi_forecast sequentially. For a 6-city
+    comparison that is up to 12 sequential network-bound calls, which was
+    the dominant cause of "stuck loading / timeout" on comparison
+    questions. A small thread pool runs all cities in parallel instead,
+    since each fetch is independent and I/O-bound.
+    """
+    if not cities:
+        raise ValueError("At least one supported city is required.")
+    comparison: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(COMPARE_CITIES_MAX_WORKERS, len(cities))) as pool:
+        futures = {pool.submit(_fetch_city_pair, city): city for city in cities}
+        results: dict[str, tuple[dict[str, Any] | None, dict[str, Any] | None, Exception | None]] = {}
+        for future in as_completed(futures):
+            city, current, forecast, error = future.result()
+            results[city] = (current, forecast, error)
+    # Preserve the caller's original city ordering in the output.
+    for city in cities:
+        current, forecast, error = results.get(city, (None, None, None))
+        if error is not None or current is None or forecast is None:
+            errors.append(city)
+            continue
         comparison.append({"city": city, "current": current, "forecast": forecast})
-    return {"cities": comparison}
+    if not comparison:
+        raise ValueError("No comparison data could be retrieved for the requested cities.")
+    result: dict[str, Any] = {"cities": comparison}
+    if errors:
+        result["unavailable_cities"] = errors
+    return result
 
 
 TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
@@ -351,7 +417,6 @@ def _obvious_hyperbole(text: str) -> bool:
     ))
 
 
-
 def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
     """Conservative local fallback; history only helps with genuinely ambiguous continuations."""
     text = text.lower().strip()
@@ -366,6 +431,9 @@ def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
         r"\bgiving up on everything\b", r"\banyone would even notice if i wasn'?t here\b",
         r"\bif i (was not|wasn'?t) here\b", r"\bjust want it to end\b",
         r"\bsuicid(?:e|al)\b", r"\bself[- ]?harm\b",
+        r"\bwhat'?s (even )?the point (of trying )?anymore\b", r"\bstopped caring what happens to me\b",
+        r"\bi'?m done,? i really am\b", r"\bbetter off without me\b", r"\bwant to disappear\b",
+        r"\bcan'?t keep doing this\b", r"\bno way out\b",
     )
     if any(re.search(pattern, text) for pattern in patterns):
         return True
@@ -390,37 +458,6 @@ def _fallback_crisis_assessment(text: str, history: list[str]) -> bool:
     return False
 
 
-
-def _llm_crisis_assessment(message: str, history: list[str]) -> bool | None:
-    """Classify CURRENT-message self-harm risk; context cannot poison unrelated later turns."""
-    payload = {"current_message": message, "recent_context": history[-3:]}
-    system = (
-        'Classify ONLY the CURRENT MESSAGE for self-harm or suicide risk. Return JSON only: {"risk": true|false}. '
-        'risk=true when the CURRENT MESSAGE itself expresses, confirms, endorses, or meaningfully continues suicide/self-harm risk, '
-        'wanting to die, burden framing, or similar personal danger. risk=false for an ordinary AQI, weather, pollution, forecast, '
-        'history, comparison, or model question EVEN IF recent_context contains an earlier crisis statement or crisis response. '
-        'Use recent_context only when the CURRENT MESSAGE is itself an ambiguous continuation such as "I still feel that way", '
-        '"yes I might", or "I am thinking about doing it". Never mark an unrelated new factual question risky solely because an '
-        'earlier message contained self-harm language. Figurative phrases such as "this smog is killing me" are risk=false unless '
-        'the current message also expresses genuine personal risk.'
-    )
-    assessment = _parse_groq_json(_groq_completion(system, payload, temperature=0.0, max_tokens=128, json_mode=True))
-    if assessment is None or not isinstance(assessment.get("risk"), bool):
-        logger.warning("Groq crisis classifier unavailable or invalid; using local fallback.")
-        return None
-    return assessment["risk"]
-
-
-
-def _is_crisis_message(text: str, history: list[str]) -> bool:
-    """Evaluate current-turn risk without letting old crisis text permanently lock the session."""
-    decision = _llm_crisis_assessment(text, history)
-    if decision is not None:
-        return bool(decision) or _fallback_crisis_assessment(text, [])
-    return _fallback_crisis_assessment(text, history)
-
-
-
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 VALID_INTENTS = {
     "current_aqi", "forecast", "current_forecast", "history", "explanation", "comparison", "weather",
@@ -429,19 +466,34 @@ VALID_INTENTS = {
 
 
 def _groq_available() -> bool:
-    """LLM routing is enabled for deployed production requests with a configured key."""
-    return settings.APP_ENV.lower() == "production" and bool(settings.GROQ_API_KEY)
+    """LLM routing is enabled whenever the Copilot is on and a Groq key is configured.
+
+    Previously this also required settings.APP_ENV.lower() == "production",
+    which meant Groq was silently never called if that environment value
+    was missing or spelled differently in a given deployment — with no
+    visible error. That implicit coupling is removed; if you need a
+    dev/staging kill-switch, use a dedicated explicit setting instead of an
+    environment-name string match.
+    """
+    return bool(settings.COPILOT_ENABLED) and bool(settings.GROQ_API_KEY)
 
 
-
-def _groq_completion(system: str, payload: dict[str, Any], *, temperature: float, max_tokens: int, json_mode: bool = False) -> str | None:
+def _groq_completion(
+    system: str,
+    payload: dict[str, Any],
+    *,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool = False,
+    timeout: int = GROQ_CALL_TIMEOUT_SECONDS,
+) -> str | None:
     """Make one bounded Groq request; callers provide deterministic fallbacks."""
     if not _groq_available():
         return None
     try:
-        response = requests.post(
+        response = _HTTP_SESSION.post(
             GROQ_CHAT_COMPLETIONS_URL,
-            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json; charset=utf-8"},
             json={
                 "model": settings.GROQ_MODEL,
                 "temperature": temperature,
@@ -454,16 +506,17 @@ def _groq_completion(system: str, payload: dict[str, Any], *, temperature: float
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
             },
-            timeout=8,
+            timeout=timeout,
         )
         response.raise_for_status()
+        response.encoding = "utf-8"
         return str(response.json()["choices"][0]["message"]["content"]).strip()
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
         logger.warning("Groq HTTP error status=%s type=%s", status, type(exc).__name__)
         return None
     except requests.Timeout:
-        logger.warning("Groq request timed out.")
+        logger.warning("Groq request timed out after %ss.", timeout)
         return None
     except Exception as exc:
         logger.warning("Groq Copilot request unavailable: %s", type(exc).__name__)
@@ -483,9 +536,16 @@ def _parse_groq_json(content: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _groq_classify_turn(message: str, history: list[str], requested_cities: list[str]) -> dict[str, Any] | None:
+    """Classify crisis risk AND routing intent in ONE Groq call.
 
-def _groq_intent_route(message: str, history: list[str], requested_cities: list[str]) -> dict[str, Any] | None:
-    """Classify the current turn before selecting any city or application tool."""
+    Previously these were two separate sequential Groq requests
+    (_llm_crisis_assessment then _groq_intent_route), each up to 8s, adding
+    a full extra round trip to every single turn. Combining them into one
+    JSON response with both a `risk` field and the routing fields cuts
+    per-turn Groq calls from up to 3 down to at most 2, which directly
+    reduces the "stuck loading / timeout" risk.
+    """
     allowed = _cities()
     payload = {
         "current_message": message,
@@ -494,26 +554,41 @@ def _groq_intent_route(message: str, history: list[str], requested_cities: list[
         "supported_cities": [{"slug": slug, "name": city["name"]} for slug, city in allowed.items()],
     }
     system = (
-        "Classify the user's CURRENT MESSAGE for a Pakistan AQI Copilot. Recent messages may resolve a genuine follow-up, but an "
-        "unrelated previous message must not override an explicit current request. Return JSON only with intent, cities, history_hours, "
-        "history_offset_hours, horizon_hours, and needs_city_clarification. intent must be exactly one of: current_aqi, forecast, "
-        "current_forecast, history, explanation, comparison, weather, pollutants, hazard_threshold, general_aqi, off_topic, clarify_city. "
-        "Use current_aqi when the user asks only for current/latest AQI or current outdoor-activity suitability. Use forecast when they "
-        "ask only about future AQI. Use current_forecast ONLY when both present AQI and future predictions are explicitly requested. "
-        "Use history for past readings/trends; set history_offset_hours=24 for yesterday, 48 for two days ago, 72 for three days ago, "
-        "otherwise null. Use comparison when comparing cities or asking which supported city has the cleanest/worst/lowest/highest AQI. "
-        "For comparison of all supported cities, return every supported slug. AQI/weather/pollutant/forecast/activity/history/comparison/"
-        "model-driving questions are in scope. Food, crime, opinions, code, and unrelated news are off_topic even if a city is named. "
-        "Never infer a city from vague references or abbreviations; set needs_city_clarification true. history_hours must be 24, 72, "
-        "168, or 720; horizon_hours must be 24, 48, or 72."
+        "You classify ONE turn for a Pakistan AQI Copilot and return JSON only with fields: risk, intent, cities, "
+        "history_hours, history_offset_hours, horizon_hours, needs_city_clarification.\n\n"
+        "STEP 1 — risk (boolean): true when the CURRENT MESSAGE itself expresses, confirms, endorses, or "
+        "meaningfully continues suicide/self-harm risk, wanting to die, burden framing ('better off without me'), "
+        "hopelessness framing ('what's the point', 'I'm done'), or similar personal danger — including indirect "
+        "phrasing that does not contain words like 'suicide'. risk=false for an ordinary AQI/weather/pollution/"
+        "forecast/history/comparison/model question EVEN IF recent_messages contain an earlier crisis statement. "
+        "Use recent_messages only when the CURRENT MESSAGE is itself an ambiguous continuation such as 'I still "
+        "feel that way' or 'yes I might'. Figurative phrases such as 'this smog is killing me' or "
+        "'suicide-inducing traffic' are risk=false unless the current message also expresses genuine personal risk. "
+        "If risk=true, all other fields may be null — routing is skipped for that turn.\n\n"
+        "STEP 2 — if risk=false, classify intent: exactly one of current_aqi, forecast, current_forecast, history, "
+        "explanation, comparison, weather, pollutants, hazard_threshold, general_aqi, off_topic, clarify_city. "
+        "Use current_aqi when the user asks only for current/latest AQI or current outdoor-activity suitability. "
+        "Use forecast when they ask only about future AQI. Use current_forecast ONLY when both present AQI and "
+        "future predictions are explicitly requested. Use history for past readings/trends; set "
+        "history_offset_hours=24 for yesterday, 48 for two days ago, 72 for three days ago, otherwise null. Use "
+        "comparison when comparing cities or asking which supported city has the cleanest/worst/lowest/highest "
+        "AQI — for comparison of all supported cities, return every supported slug. AQI/weather/pollutant/"
+        "forecast/activity/history/comparison/model-driving questions are in scope. Food, crime, opinions, code, "
+        "and unrelated news are off_topic even if a city is named. Never infer a city from vague references or "
+        "abbreviations; set needs_city_clarification true instead. history_hours must be 24, 72, 168, or 720; "
+        "horizon_hours must be 24, 48, or 72."
     )
-    route = _parse_groq_json(_groq_completion(system, payload, temperature=0.0, max_tokens=384, json_mode=True))
-    if not route or route.get("intent") not in VALID_INTENTS:
+    result = _parse_groq_json(_groq_completion(system, payload, temperature=0.0, max_tokens=320, json_mode=True))
+    if result is None or not isinstance(result.get("risk"), bool):
         return None
-    route["cities"] = [city for city in route.get("cities", []) if city in allowed]
-    route["history_hours"] = route.get("history_hours") if route.get("history_hours") in (24, 72, 168, 720) else 72
-    route["horizon_hours"] = route.get("horizon_hours") if route.get("horizon_hours") in (24, 48, 72) else 24
-    offset = route.get("history_offset_hours")
+    if result["risk"]:
+        return {"risk": True}
+    if result.get("intent") not in VALID_INTENTS:
+        return None
+    result["cities"] = [city for city in result.get("cities", []) if city in allowed]
+    result["history_hours"] = result.get("history_hours") if result.get("history_hours") in (24, 72, 168, 720) else 72
+    result["horizon_hours"] = result.get("horizon_hours") if result.get("horizon_hours") in (24, 48, 72) else 24
+    offset = result.get("history_offset_hours")
     if isinstance(offset, bool):
         offset = None
     elif offset is not None:
@@ -521,11 +596,10 @@ def _groq_intent_route(message: str, history: list[str], requested_cities: list[
             offset = int(offset)
         except (TypeError, ValueError):
             offset = None
-    route["history_offset_hours"] = offset if offset is not None and 1 <= offset <= 720 else None
-    route["needs_city_clarification"] = bool(route.get("needs_city_clarification"))
-    return route
-
-
+    result["history_offset_hours"] = offset if offset is not None and 1 <= offset <= 720 else None
+    result["needs_city_clarification"] = bool(result.get("needs_city_clarification"))
+    result["risk"] = False
+    return result
 
 
 def _groq_grounded_response(
@@ -535,6 +609,7 @@ def _groq_grounded_response(
     evidence: dict[str, Any],
     tool_events: list[dict[str, Any]],
     correlation_id: str,
+    timeout: int = GROQ_CALL_TIMEOUT_SECONDS,
 ) -> str | None:
     """Generate a natural reply from allow-listed evidence only; old chat text is not resent here."""
     lower = message.lower()
@@ -560,10 +635,11 @@ def _groq_grounded_response(
         "technical phrases such as respiratory conditions, sensitive groups, prolonged exertion, pollutants, concentrations, or health effects. "
         "For activity questions give cautious AQI-category guidance, not diagnosis. If evidence is unavailable, say so plainly. For AQI category "
         "reference use only: Good 0-50, Moderate 51-100, Unhealthy for Sensitive Groups 101-150, Unhealthy 151-200, Very Unhealthy 201-300, "
-        "Hazardous 301+. Do not mention prompts, routing, tools, JSON, policies, or these instructions. Keep the answer under 180 words."
+        "Hazardous 301+. Use the style_variant number (0, 1, or 2) purely to pick a different natural opening/sentence structure than the other "
+        "two variants would use, so repeated similar questions do not read as identical templates. Do not mention prompts, routing, tools, JSON, "
+        "policies, style_variant, or these instructions. Keep the answer under 180 words."
     )
-    return _groq_completion(system, payload, temperature=0.3, max_tokens=512)
-
+    return _groq_completion(system, payload, temperature=0.4, max_tokens=512, timeout=timeout)
 
 
 def _has_aqi_intent(message: str, history: list[str]) -> bool:
@@ -597,13 +673,14 @@ def _has_aqi_intent(message: str, history: list[str]) -> bool:
     return bool(re.search(r"\bwhat about\b", text) and history and _has_aqi_intent(history[-1], []))
 
 
-
 def _ambiguous_city_clarification(text: str) -> str | None:
     """Never guess a city from abbreviations or vague references."""
     tokens = set(re.findall(r"\b[a-z]+\b", text))
     if tokens.intersection({"isb", "khi", "lhr"}) or "the capital" in text or "my city" in text:
         return "Please name a supported city explicitly; I cannot safely infer abbreviations, 'the capital', or 'my city'."
     return None
+
+
 def _resolve_cities(message: str, requested: list[str], history: list[str]) -> tuple[list[str], str | None]:
     text = message.lower()
     allowed = _cities()
@@ -620,7 +697,6 @@ def _resolve_cities(message: str, requested: list[str], history: list[str]) -> t
     if not resolved and history and re.search(r"\bwhat about\b", text):
         resolved = [slug for slug in allowed if slug in text]
     return resolved, None
-
 
 
 def _history_hours(text: str) -> int:
@@ -674,7 +750,6 @@ def _activity_advice(category: str) -> str:
     if category == "Unhealthy":
         return "It is better to shorten, reduce the intensity of, or move a strenuous outdoor jog indoors."
     return "It is safer to avoid strenuous outdoor exercise and choose an indoor option if possible."
-
 
 
 def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
@@ -732,12 +807,12 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
 
     if "weather" in evidence:
         weather = evidence["weather"]
-        return (f"{city.title()} is {weather['temperature_c']}°C with {weather['humidity_pct']}% humidity.\n\n"
+        return (f"{city.title()} is {weather['temperature_c']}\u00b0C with {weather['humidity_pct']}% humidity.\n\n"
                 f"Wind is {weather['wind_kph']} km/h and precipitation is {weather['precipitation_mm']} mm. Stored observation: {weather['observed_at_utc']}.") + _stale_notice(weather)
     if "pollutants" in evidence:
         p = evidence["pollutants"]
-        return (f"For {city.title()}, PM2.5 is {p['pm2_5']} µg/m³ and PM10 is {p['pm10']} µg/m³.\n\n"
-                f"NO₂ is {p['no2']} µg/m³ and ozone is {p['ozone']} µg/m³. Stored observation: {p['observed_at_utc']}.") + _stale_notice(p)
+        return (f"For {city.title()}, PM2.5 is {p['pm2_5']} \u00b5g/m\u00b3 and PM10 is {p['pm10']} \u00b5g/m\u00b3.\n\n"
+                f"NO\u2082 is {p['no2']} \u00b5g/m\u00b3 and ozone is {p['ozone']} \u00b5g/m\u00b3. Stored observation: {p['observed_at_utc']}.") + _stale_notice(p)
     if "explanation" in evidence:
         e = evidence["explanation"]
         factors = ", ".join(item["feature"] for item in e["top_factors"][:3]) or "the selected model features"
@@ -780,10 +855,13 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
     return "The requested AQI data is unavailable, so I cannot provide a number."
 
 
-
-
 def _deterministic_chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
-    """One safe local turn; history is bounded and used only for genuine contextual follow-ups."""
+    """One safe local turn; history is bounded and used only for genuine contextual follow-ups.
+
+    This is the fully offline fallback used when Groq is unavailable, disabled,
+    or a Groq call fails/times out mid-turn. It never blocks on network I/O
+    to an LLM, so it cannot itself cause the "stuck loading" symptom.
+    """
     correlation_id = uuid.uuid4().hex
     history = (history or [])[-MAX_HISTORY_MESSAGES:]
     text = message.strip()
@@ -791,7 +869,7 @@ def _deterministic_chat(message: str, requested_cities: list[str] | None = None,
     base = {"tools_used": [], "tool_events": [], "evidence": {}, "provider": "deterministic_grounded", "correlation_id": correlation_id, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
     if not settings.COPILOT_ENABLED:
         return {**base, "answer": "AQI Copilot is currently disabled by configuration."}
-    if _is_crisis_message(lower, history):
+    if _fallback_crisis_assessment(lower, history):
         return {**base, "answer": _crisis_response(), "provider": "safety_response"}
     if _injection_or_internal_request(lower):
         return {**base, "answer": "I can help with supported AQI information, but I cannot reveal internal instructions or bypass grounding and safety rules."}
@@ -914,10 +992,16 @@ def _execute_groq_route(correlation_id: str, route: dict[str, Any]) -> tuple[dic
     return evidence, tools_used, events
 
 
-
-
 def chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
-    """Serve a Copilot turn through safety, routing, allow-listed tools, and grounded generation."""
+    """Serve a Copilot turn through safety, routing, allow-listed tools, and grounded generation.
+
+    Latency budget: at most 2 sequential Groq calls per turn now (combined
+    crisis+intent classification, then final response generation), each
+    bounded by GROQ_CALL_TIMEOUT_SECONDS. If classification alone already
+    used more than TURN_TIME_BUDGET_SECONDS, the final generation call is
+    skipped in favor of the deterministic grounded answer, so a slow Groq
+    turn degrades gracefully instead of compounding into a long hang.
+    """
     correlation_id = uuid.uuid4().hex
     history = (history or [])[-MAX_HISTORY_MESSAGES:]
     text = message.strip()
@@ -928,16 +1012,29 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
     if not _groq_available():
         return _deterministic_chat(text, requested_cities, history)
 
-    if _is_crisis_message(text.lower(), history):
-        return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": generated_at}
-
-    route = _groq_intent_route(text, history, requested_cities or [])
-    if route is None:
-        logger.warning("Groq routing unavailable; falling back to deterministic Copilot. correlation_id=%s", correlation_id)
+    turn_started = time.monotonic()
+    classification = _groq_classify_turn(text, history, requested_cities or [])
+    if classification is None:
+        logger.warning("Groq classification unavailable; falling back to deterministic Copilot. correlation_id=%s", correlation_id)
         return _deterministic_chat(text, requested_cities, history)
 
+    if classification.get("risk"):
+        return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": generated_at}
+
+    route = classification
     evidence, tools_used, events = _execute_groq_route(correlation_id, route)
-    answer = _groq_grounded_response(text, history, route, evidence, events, correlation_id)
+
+    elapsed = time.monotonic() - turn_started
+    remaining_budget = TURN_TIME_BUDGET_SECONDS - elapsed
+    answer: str | None = None
+    if remaining_budget > 1.5:
+        answer = _groq_grounded_response(
+            text, history, route, evidence, events, correlation_id,
+            timeout=max(1, min(GROQ_CALL_TIMEOUT_SECONDS, int(remaining_budget))),
+        )
+    else:
+        logger.warning("Turn time budget exhausted after classification; skipping response generation call. correlation_id=%s elapsed=%.2fs", correlation_id, elapsed)
+
     provider = "groq_grounded"
     if not answer:
         logger.warning("Groq response generation unavailable; using deterministic grounded response. correlation_id=%s", correlation_id)
@@ -945,4 +1042,3 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
         provider = "deterministic_response_fallback"
 
     return {"answer": answer, "tools_used": tools_used, "tool_events": events, "evidence": evidence, "provider": provider, "correlation_id": correlation_id, "generated_at_utc": generated_at}
-
