@@ -290,15 +290,3 @@ def copilot_chat(request: CopilotChatRequest) -> dict:
             status_code=503,
             detail="Copilot evidence is temporarily unavailable.",
         ) from exc
-    except Exception:
-        logger.exception("Unexpected Copilot failure; returning a safe response.")
-        return {
-            "answer": (
-                "AQI Copilot is temporarily unable to complete that request. "
-                "Please try again shortly."
-            ),
-            "tools_used": [],
-            "tool_events": [],
-            "evidence": {},
-            "provider": "service_fallback",
-        }

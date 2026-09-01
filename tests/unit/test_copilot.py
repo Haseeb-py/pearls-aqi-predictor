@@ -13,18 +13,3 @@ def test_copilot_uses_grounded_tools(monkeypatch):
     response = TestClient(app).post("/api/v1/copilot/chat", json={"message": "Lahore AQI"})
     assert response.status_code == 200
     assert response.json()["provider"] == "deterministic_grounded"
-
-def test_copilot_unexpected_error_returns_safe_response(monkeypatch):
-    def fail(*_args, **_kwargs):
-        raise RuntimeError("unexpected provider failure")
-
-    monkeypatch.setattr("pearls_aqi.api.main.chat", fail)
-
-    response = TestClient(app).post(
-        "/api/v1/copilot/chat",
-        json={"message": "Tell me a joke about Lahore"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["provider"] == "service_fallback"
-    assert response.json()["tools_used"] == []

@@ -97,7 +97,7 @@ def test_production_classifier_sends_at_most_three_history_messages(monkeypatch)
     monkeypatch.setattr(copilot.requests, "post", fake_post)
     assert copilot._llm_crisis_assessment("I want it to end", ["a", "b", "c", "d"]) is True
     sent = captured["json"]["messages"][1]["content"]
-    assert '"recent_context": ["b", "c", "d"]' in sent
+    assert '"recent_messages": ["b", "c", "d"]' in sent
 
 def test_ambiguous_end_it_follow_up_is_caught_before_off_topic(monkeypatch):
     monkeypatch.setattr(copilot, "_llm_crisis_assessment", lambda _message, _history: None)
