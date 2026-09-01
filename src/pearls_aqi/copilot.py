@@ -1,4 +1,4 @@
-#another changes
+#new changes
 """Safe, deterministic AQI Copilot with an explicit application-tool allow-list."""
 
 import json
@@ -758,8 +758,7 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
         forecasts = forecast["forecasts"]
         if any(term in text for term in ("tomorrow", "next 24", "24 hour", "24h")):
             item = next(item for item in forecasts if item["horizon_hours"] == 24)
-            valid_at = item.get("valid_at_utc", forecast.get("issued_at_utc", "unavailable"))
-            return f"For tomorrow, {city.title()} is forecast at {item['aqi']:.1f} AQI ({item['category']}).\n\nForecast valid at: {valid_at}." + _stale_notice(forecast)
+            return f"{city.title()}'s AQI is forecast to be {item['aqi']:.1f} ({item['category']}) in 24 hours.\n\nForecast valid at: {item['valid_at_utc']}." + _stale_notice(forecast)
         if any(term in text for term in ("48 hour", "48h", "two days", "2 days")):
             item = next(item for item in forecasts if item["horizon_hours"] == 48)
             return f"{city.title()}'s 48-hour AQI forecast is {item['aqi']:.1f} ({item['category']}).\n\nForecast valid at: {item['valid_at_utc']}." + _stale_notice(forecast)
@@ -772,10 +771,7 @@ def _answer(message: str, evidence: dict[str, Any], cities: list[str]) -> str:
         forecast_values = {item["horizon_hours"]: item["aqi"] for item in forecast["forecasts"]}
         values = _forecast_summary(forecast["forecasts"])
         if asks_activity:
-            aqi_note = ""
-            if "aqi" in text and any(term in text for term in ("what's the deal", "what is aqi", "what does aqi", "mean")):
-                aqi_note = "\n\nAQI means Air Quality Index; lower values indicate cleaner air."
-            return f"{city.title()}'s latest AQI is {current['aqi']:.1f} ({current['category']}).\n\n{_activity_advice(current['category'])}{aqi_note}\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
+            return f"{city.title()}'s latest AQI is {current['aqi']:.1f} ({current['category']}).\n\n{_activity_advice(current['category'])}\n\n{values}\n\nStored observation: {current['observed_at_utc']}." + _stale_notice(current)
         if any(term in text for term in ("why", "worse", "better", "trend")):
             change = forecast_values[72] - current["aqi"]
             direction = "worsening" if change > 5 else "improving" if change < -5 else "broadly stable"
@@ -820,7 +816,7 @@ def _deterministic_chat(message: str, requested_cities: list[str] | None = None,
     elif cities:
         city = cities[0]
         plan: list[tuple[str, str, tuple]] = []
-        weather_terms = ("weather", "temperature", "humidity", "wind", "rain", "pressure", "heat")
+        weather_terms = ("weather", "temperature", "humidity", "wind", "rain", "pressure")
         pollutant_terms = ("pm2", "pm10", "pollutant", "ozone", "no2", "so2", "carbon monoxide")
         history_terms = ("history", "last day", "last 24", "past 24", "past 3", "historical", "last week", "past week", "past month", "last month", "last few days", "trend over", "yesterday", "day ago", "days ago")
         explanation_terms = ("explain", "shap", "feature importance", "predicted high", "what's driving", "whats driving", "driving", "why is", "why was")
@@ -831,25 +827,13 @@ def _deterministic_chat(message: str, requested_cities: list[str] | None = None,
 
         wants_history = any(term in lower for term in history_terms)
         wants_explanation = any(term in lower for term in explanation_terms) or ("predicted" in lower and "high" in lower)
-        followup_forecast = bool(
-            re.search(r"\bwhat about\b", lower)
-            and history
-            and any(term in history[-1].lower() for term in forecast_terms)
-        )
-        wants_forecast = (
-            not wants_history
-            and not wants_explanation
-            and (any(term in lower for term in forecast_terms) or followup_forecast)
-        )
+        wants_forecast = not wants_history and not wants_explanation and any(term in lower for term in forecast_terms)
         explicitly_current = any(term in lower for term in explicit_current_terms)
         generic_status = any(term in lower for term in generic_status_terms)
         activity_question = any(term in lower for term in activity_terms)
-        speculation_forecast = "ignore current" in lower or "what you think" in lower or "it'll be" in lower
-        if activity_question or speculation_forecast:
-            wants_forecast = not wants_history and not wants_explanation
         followup_status = bool(re.search(r"\bwhat about\b", lower) and history and _has_aqi_intent(history[-1], []))
-        wants_current = not wants_history and not wants_explanation and (explicitly_current or activity_question or (not wants_forecast and (generic_status or followup_status)))
-        if wants_forecast and (explicitly_current or followup_forecast):
+        wants_current = not wants_history and not wants_explanation and (explicitly_current or (not wants_forecast and (generic_status or activity_question or followup_status)))
+        if wants_forecast and explicitly_current:
             wants_current = True
 
         if wants_current:
