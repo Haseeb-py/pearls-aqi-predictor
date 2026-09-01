@@ -67,7 +67,7 @@ def test_ambiguous_hazard_threshold_answer_is_grounded_and_not_declined():
 def test_history_questions_call_only_real_history_tool(monkeypatch, message, expected_hours):
     calls = []
 
-    def history(city, hours):
+    def history(city, hours, offset_hours=None):
         calls.append((city, hours))
         return {
             "city": city,

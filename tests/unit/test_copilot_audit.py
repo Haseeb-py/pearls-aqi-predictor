@@ -38,13 +38,13 @@ def test_follow_up_city_keeps_forecast_intent(monkeypatch):
     monkeypatch.setitem(copilot.TOOLS, "get_aqi_forecast", lambda city: {"city": city, "issued_at_utc": "2025-01-01T00:00:00+00:00", "is_stale": False, "forecasts": [{"horizon_hours": 24, "aqi": 72.0, "category": "Moderate"}, {"horizon_hours": 48, "aqi": 73.0, "category": "Moderate"}, {"horizon_hours": 72, "aqi": 74.0, "category": "Moderate"}]})
     result = copilot.chat("What about Karachi?", history=["What is Lahore AQI forecast?"])
     assert result["tools_used"] == ["get_current_aqi", "get_aqi_forecast"]
-    assert "Karachi is currently" in result["answer"]
+    assert "Karachi's latest AQI" in result["answer"]
 
 
 def test_multi_part_city_question_answers_status_activity_and_aqi_meaning(monkeypatch):
     monkeypatch.setitem(copilot.TOOLS, "get_current_aqi", lambda city: {"city": city, "aqi": 128.0, "category": "Unhealthy for Sensitive Groups", "observed_at_utc": "2025-01-01T00:00:00+00:00", "is_stale": False, "aqi_change_24h": 0.0})
     monkeypatch.setitem(copilot.TOOLS, "get_aqi_forecast", lambda city: {"city": city, "issued_at_utc": "2025-01-01T00:00:00+00:00", "is_stale": False, "forecasts": [{"horizon_hours": 24, "aqi": 130.0, "category": "Unhealthy for Sensitive Groups"}, {"horizon_hours": 48, "aqi": 120.0, "category": "Unhealthy for Sensitive Groups"}, {"horizon_hours": 72, "aqi": 115.0, "category": "Unhealthy for Sensitive Groups"}]})
-    result = copilot.chat("hey, how's the air in Lahore looking? should I go for a jog today? what's the deal with AQI anyway?")
+    result = copilot.chat("hey, how's the air in Lahore looking? should I go for a jog today? what's the deal with AQI anyway, and what is tomorrow's forecast?")
     assert result["tools_used"] == ["get_current_aqi", "get_aqi_forecast"]
     assert "jog" in result["answer"].lower()
     assert "AQI means Air Quality Index" in result["answer"]

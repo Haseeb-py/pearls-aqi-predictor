@@ -19,3 +19,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "integration" in item.keywords:
             item.add_marker(skip)
+
+@pytest.fixture(autouse=True)
+def disable_live_groq_by_default(monkeypatch):
+    """Unit tests must not call the developer's configured Groq account."""
+    from pearls_aqi import copilot
+
+    monkeypatch.setattr(copilot.settings, "APP_ENV", "development")
+    monkeypatch.setattr(copilot.settings, "GROQ_API_KEY", None)
