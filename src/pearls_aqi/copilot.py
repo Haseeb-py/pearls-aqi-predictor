@@ -917,6 +917,64 @@ def _execute_groq_route(correlation_id: str, route: dict[str, Any]) -> tuple[dic
 
 
 
+def _fast_non_model_response(
+    message: str,
+    requested_cities: list[str],
+    history: list[str],
+    correlation_id: str,
+    generated_at: str,
+) -> dict[str, Any] | None:
+    """Answer clear non-model requests without extra Groq calls after safety screening."""
+    lower = message.lower()
+    base = {
+        "tools_used": [],
+        "tool_events": [],
+        "evidence": {},
+        "provider": "deterministic_grounded",
+        "correlation_id": correlation_id,
+        "generated_at_utc": generated_at,
+    }
+
+    if _off_topic(lower) and not _has_aqi_intent(message, history):
+        return {
+            **base,
+            "answer": (
+                "I can help with AQI, weather, pollutants, forecasts, history, "
+                "comparisons, and model explanations for supported cities."
+            ),
+        }
+
+    cities, clarification = _resolve_cities(message, requested_cities, history)
+    if clarification and "not supported" in clarification:
+        return {**base, "answer": clarification}
+
+    simple_words = any(phrase in lower for phrase in (
+        "very simple", "super simple", "like i'm five", "like im five",
+        "like i am five", "eli5", "simple words",
+    ))
+    if simple_words and "aqi" in lower and len(cities) == 1:
+        result, event = _run_tool(correlation_id, "get_current_aqi", cities[0])
+        if result is None:
+            return {
+                **base,
+                "tools_used": ["get_current_aqi"],
+                "tool_events": [event],
+                "answer": "The latest AQI data is temporarily unavailable. Please try again shortly.",
+            }
+        return {
+            **base,
+            "tools_used": ["get_current_aqi"],
+            "tool_events": [event],
+            "evidence": {"current": result},
+            "answer": (
+                f"{cities[0].title()}'s latest AQI is {result['aqi']:.0f}. "
+                f"In simple words: the air is {result['category'].lower()}. "
+                "Lower AQI means cleaner air."
+            ) + _stale_notice(result),
+        }
+
+    return None
+
 def chat(message: str, requested_cities: list[str] | None = None, history: list[str] | None = None) -> dict[str, Any]:
     """Serve a Copilot turn through safety, routing, allow-listed tools, and grounded generation."""
     correlation_id = uuid.uuid4().hex
@@ -931,6 +989,12 @@ def chat(message: str, requested_cities: list[str] | None = None, history: list[
 
     if _is_crisis_message(text.lower(), history):
         return {"answer": _crisis_response(), "tools_used": [], "tool_events": [], "evidence": {}, "provider": "safety_response", "correlation_id": correlation_id, "generated_at_utc": generated_at}
+
+    fast_response = _fast_non_model_response(
+        text, requested_cities or [], history, correlation_id, generated_at
+    )
+    if fast_response is not None:
+        return fast_response
 
     route = _groq_intent_route(text, history, requested_cities or [])
     if route is None:

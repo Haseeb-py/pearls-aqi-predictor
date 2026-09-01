@@ -59,8 +59,8 @@ def test_production_turn_calls_groq_for_crisis_intent_and_final_response(monkeyp
     assert result["answer"].startswith("Lahore is in the Moderate")
     assert result["tools_used"] == ["get_current_aqi", "get_aqi_forecast"]
     assert len(calls) == 3
-    assert json.loads(calls[0]["messages"][1]["content"])["recent_messages"] == ["Another", "Recent", "Ignored"]
-    assert "Classify the user's meaning" in calls[1]["messages"][0]["content"]
+    assert json.loads(calls[0]["messages"][1]["content"])["recent_context"] == ["Another", "Recent", "Ignored"]
+    assert "Classify the user's CURRENT MESSAGE" in calls[1]["messages"][0]["content"]
     assert "tool_evidence" in calls[2]["messages"][1]["content"]
 
 
@@ -88,7 +88,7 @@ def test_production_history_route_never_runs_forecast(monkeypatch):
         "Karachi improved from 170 to 150 AQI over the available history.",
     ])
     monkeypatch.setattr(copilot.requests, "post", lambda _url, **_kwargs: _groq_response(next(replies)))
-    monkeypatch.setitem(copilot.TOOLS, "get_aqi_history", lambda city, hours: {
+    monkeypatch.setitem(copilot.TOOLS, "get_aqi_history", lambda city, hours, offset_hours=None: {
         "city": city, "hours": hours, "is_stale": False,
         "points": [{"time": "2026-01-01T00:00:00+00:00", "aqi": 170.0}, {"time": "2026-01-02T00:00:00+00:00", "aqi": 150.0}],
     })
@@ -132,3 +132,50 @@ def test_production_semantic_crisis_classifier_catches_new_indirect_phrasings(mo
         assert result["provider"] == "safety_response", message
         assert result["tools_used"] == [], message
         assert len(calls) == 1, message
+
+def test_clear_off_topic_skips_extra_groq_calls_after_safety(monkeypatch):
+    _enable_production(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        copilot.requests,
+        "post",
+        lambda _url, **kwargs: calls.append(kwargs["json"]) or _groq_response('{"risk": false}'),
+    )
+
+    result = copilot.chat("Tell me a joke about Lahore")
+
+    assert result["tools_used"] == []
+    assert len(calls) == 1
+
+
+def test_unsupported_city_skips_extra_groq_calls_after_safety(monkeypatch):
+    _enable_production(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        copilot.requests,
+        "post",
+        lambda _url, **kwargs: calls.append(kwargs["json"]) or _groq_response('{"risk": false}'),
+    )
+
+    result = copilot.chat("What is Faisalabad's AQI?")
+
+    assert "not supported" in result["answer"]
+    assert result["tools_used"] == []
+    assert len(calls) == 1
+
+
+def test_simple_aqi_request_skips_model_explanation_and_extra_groq_calls(monkeypatch):
+    _enable_production(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        copilot.requests,
+        "post",
+        lambda _url, **kwargs: calls.append(kwargs["json"]) or _groq_response('{"risk": false}'),
+    )
+    monkeypatch.setitem(copilot.TOOLS, "get_current_aqi", _status)
+
+    result = copilot.chat("Explain Islamabad's AQI in very simple words")
+
+    assert result["tools_used"] == ["get_current_aqi"]
+    assert "simple words" in result["answer"]
+    assert len(calls) == 1
